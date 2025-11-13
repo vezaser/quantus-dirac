@@ -5,7 +5,6 @@ say() {
   echo -e "$*"
 }
 
-# Sprawdzenie wymaganych narzędzi
 need() {
   command -v "$1" >/dev/null 2>&1 || {
     say "❌ Brak: $1. Zainstaluj i uruchom ponownie."
@@ -14,9 +13,14 @@ need() {
 }
 
 need docker
+# przyda się też curl lub wget
+if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+  say "❌ Brak curl ani wget. Zainstaluj (w WSL: 'sudo apt-get install -y curl')."
+  exit 1
+fi
 
-say "🚀 Quantus (DIRAC) — Node + Miner w Dockerze"
-say "---------------------------------------------"
+say "🚀 Quantus DIRAC — node + miner w Dockerze (wersja bez apt-get w kontenerach)"
+say "----------------------------------------------------------------------------"
 
 # 0) Sprzątanie
 say "🧹 Czyszczę stare kontenery/obrazy..."
@@ -30,88 +34,76 @@ WORKDIR="/root/quantus-dirac"
 mkdir -p "$WORKDIR/quantus_node_data"
 cd "$WORKDIR"
 
-# 2) Pytania
+# 2) Pytania o node
 read -rp "👉 Podaj nazwę swojego noda (np. C01): " NODE_NAME
 
-read -rp "👉 Czy masz adres do nagród? (t/n): " HAVE_ADDR
+read -rp "👉 Czy masz adres do nagród (qz...)? (t/n): " HAVE_ADDR
 REWARD_ADDR=""
 
 if [[ "$HAVE_ADDR" =~ ^[TtYy]$ ]]; then
   read -rp "👉 Wklej adres nagród (qz...): " REWARD_ADDR
 else
-  say "🔐 Generuję nowy adres w kontenerze nodowym..."
+  say "🔐 Generuję nowy adres w kontenerze z nodem..."
   docker pull ghcr.io/quantus-network/quantus-node:v0.4.2 >/dev/null
 
   GENFILE="keys_dirac_${NODE_NAME}_$(date +%F_%H-%M-%S).txt"
 
   docker run --rm ghcr.io/quantus-network/quantus-node:v0.4.2 \
-    key generate --scheme dilithium | tee "$GENFILE" >/dev/null
+    key generate --scheme dilithium | tee "$GENFILE"
 
   REWARD_ADDR=$(grep '^Address:' "$GENFILE" | awk '{print $2}')
 
-  [[ -n "$REWARD_ADDR" ]] || {
+  if [[ -z "$REWARD_ADDR" ]]; then
     say "❌ Nie udało się odczytać adresu z pliku $GENFILE."
     exit 1
-  }
+  fi
 
-  say "📁 Klucze zapisane: $WORKDIR/$GENFILE"
+  say "📁 Klucze zapisane w: $WORKDIR/$GENFILE"
   read -rp "✅ Zapisałeś seed/adres? (t/n): " OK
-  [[ "$OK" =~ ^[TtYy]$ ]] || {
-    say "❌ Przerwano przez użytkownika."
-    exit 1
-  }
+  [[ "$OK" =~ ^[TtYy]$ ]] || { say "❌ Przerwano przez użytkownika."; exit 1; }
 fi
 
-say "ℹ️  Użyję adresu nagród: $REWARD_ADDR"
-say "ℹ️  Nazwa noda: $NODE_NAME"
+say "ℹ️  Używam adresu nagród: $REWARD_ADDR"
+say "ℹ️  Nazwa noda:           $NODE_NAME"
 
-# 3) Dockerfile dla minera (build from source w obrazie)
+# 3) Pobieramy gotowy binarek quantus-miner na hosta (do katalogu roboczego)
+MINER_URL="https://github.com/Quantus-Network/quantus-miner/releases/download/v0.3.0/quantus-miner-linux-x86_64"
+say "⬇️  Pobieram quantus-miner z:"
+say "    $MINER_URL"
+
+if command -v curl >/dev/null 2>&1; then
+  curl -L "$MINER_URL" -o quantus-miner
+else
+  wget -O quantus-miner "$MINER_URL"
+fi
+
+chmod +x quantus-miner
+
+# 4) Tworzymy prosty Dockerfile.miner BEZ apt-get
 cat > Dockerfile.miner <<'EOF'
-FROM rust:1.81-bullseye AS builder
+FROM debian:bullseye-slim
 
-# Zależności do niektórych crate'ów
-RUN apt-get update -y && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev clang cmake git ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+# prosty user, bez apt-get
+RUN useradd -m miner
 
-WORKDIR /src
-
-# Pobranie źródeł
-RUN git clone https://github.com/Quantus-Network/quantus-miner .
-
-# Próba przejścia na tag v1.0 (jeśli istnieje)
-ARG MINER_TAG=v1.0
-RUN git fetch --all --tags -q && (git checkout -q "${MINER_TAG}" || true)
-
-# Build
-RUN cargo build --release
-
-# Runtime na Ubuntu (stabilniejsze repozytoria niż debian-slim na części sieci)
-FROM ubuntu:24.04
-
-RUN useradd -m miner && \
-    apt-get update -y && apt-get install -y --no-install-recommends ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
-
-COPY --from=builder /src/target/release/quantus-miner /usr/local/bin/quantus-miner
+# binarka dostarczona z kontekstu builda
+COPY quantus-miner /usr/local/bin/quantus-miner
 
 USER miner
-
 EXPOSE 9833
 
-# Domyślne: silnik CPU FAST, port 9833; WORKERS nadpiszesz w compose
 ENTRYPOINT ["quantus-miner"]
 EOF
 
-say "🛠  Buduję obraz minera (local/quantus-miner:latest)..."
-docker build -f Dockerfile.miner -t local/quantus-miner:latest --build-arg MINER_TAG=v1.0 .
+say "🛠  Buduję obraz minera (local/quantus-miner:latest) — bez apt-get..."
+docker build -f Dockerfile.miner -t local/quantus-miner:latest .
 
-# 4) Wylicz workers (rdzenie-1, minimum 1)
+# 5) Obliczamy liczbę wątków dla minera
 CPUS=$(nproc 2>/dev/null || echo 2)
 WORKERS=$(( CPUS>1 ? CPUS-1 : 1 ))
 say "⚙️  Workerów dla minera: $WORKERS (CPU: $CPUS)"
 
-# 5) docker-compose.yml (bez przestarzałego 'version')
+# 6) docker-compose.yml (node + miner)
 cat > docker-compose.yml <<EOF
 services:
   quantus-node:
@@ -166,12 +158,12 @@ services:
       - quantus-node
 EOF
 
-# 6) Start
-say "🐳 Uruchamiam Docker Compose (node + miner)..."
+# 7) Start
+say "🐳 Uruchamiam docker compose (node + miner)..."
 docker compose up -d
 
-# 7) Krótki health-check
-say "⏳ Czekam 10s i sprawdzam logi..."
+# 8) Krótki podgląd logów
+say "⏳ Czekam 10 sekund i pokazuję logi..."
 sleep 10
 
 say "----- NODE (ostatnie linie) -----"
@@ -182,8 +174,11 @@ docker logs --since 30s quantus-miner 2>&1 | tail -n 50 || true
 
 say "---------------------------------"
 say "✅ GOTOWE!"
-say " • Node:   $NODE_NAME"
-say " • Rewards: $REWARD_ADDR"
-say " • Sprawdź:   docker ps"
-say " • Logi node: docker logs -f quantus-node"
-say " • Logi miner: docker logs -f quantus-miner"
+say " • Katalog:  $WORKDIR"
+say " • Node:     $NODE_NAME"
+say " • Rewards:  $REWARD_ADDR"
+say ""
+say "Sprawdź:"
+say "  docker ps"
+say "  docker logs -f quantus-node"
+say "  docker logs -f quantus-miner"
