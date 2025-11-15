@@ -148,12 +148,13 @@ docker build -f Dockerfile.miner -t local/quantus-miner:latest --build-arg MINER
 CPUS=$(nproc 2>/dev/null || echo 2)
 WORKERS=$(( CPUS>1 ? CPUS-1 : 1 ))
 
-# 8) docker-compose.yml – z node_key i --node-key-file
+# 8) docker-compose.yml – z node_key, --node-key-file i user: \"0:0\"
 cat > docker-compose.yml <<EOF
 services:
   quantus-node:
     image: ghcr.io/quantus-network/quantus-node:v0.4.2
     container_name: quantus-node
+    user: "0:0"
     restart: unless-stopped
     command: >
       --validator
