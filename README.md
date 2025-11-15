@@ -1,17 +1,18 @@
-Jak używać (skrót)
+# 🚀 Quantus DIRAC — Instalator Node + Miner (Docker)
 
-cd /root
-nano install_quantus_dirac_compose_v0.4.2.sh   # wklejasz powyższy skrypt
-chmod +x install_quantus_dirac_compose_v0.4.2.sh
-./install_quantus_dirac_compose_v0.4.2.sh
+To repozytorium zawiera kompletny instalator nodów i minera **Quantus Dirac** działający w Dockerze.  
+Instalacja działa na:  
+- Ubuntu  
+- Debian  
+- Fedora  
+- Rocky/Alma  
+- Każdym Linuxie z Dockerem  
 
+---
 
-	•	Podajesz (lub akceptujesz):
-	•	nazwę noda,
-	•	adres nagród.
-	•	Skrypt robi resztę.
-	•	Potem: cd /root
+## ⚡ Instalacja jednym poleceniem
 
-cd /root/quantus-dirac
-docker compose ps
-docker compose logs -f
+Uruchom w terminalu:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/vezaser/quantus-dirac/main/install_quantus_all_docker.sh)
