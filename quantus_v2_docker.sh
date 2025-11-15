@@ -5,110 +5,104 @@ say() { echo -e "$*"; }
 
 need_root() {
   if [[ "$(id -u)" -ne 0 ]]; then
-    say "❌ Uruchom jako root:"
-    say "   sudo $0"
+    say "❌ Uruchom jako root!"
     exit 1
   fi
 }
 
 need_root
 
-say "🚀 Quantus DIRAC — instalacja node + miner (Docker)"
-say "    ✔ w pełni zgodne z MINING.md"
+say "🚀 Quantus DIRAC — instalacja NODE + MINER (Docker)"
 say "-----------------------------------------------------"
 
-### 1) Pakiety systemowe
-say "📦 Instaluję wymagane pakiety..."
-export DEBIAN_FRONTEND=noninteractive
+###############################################################################
+# 0) Usuwamy WSZYSTKO, co powoduje konflikt (docker.io, containerd.io)
+###############################################################################
+say "🧹 Czyszczę stare pakiety docker.io / containerd..."
 
-apt-get update -y
-apt-get install -y \
-  curl wget git ca-certificates \
-  docker.io docker-compose-plugin
+apt-get remove -y docker.io docker-compose-plugin containerd.io containerd runc || true
+apt-get autoremove -y || true
+
+###############################################################################
+# 1) Instalacja Docker CE (tylko z get.docker.com)
+###############################################################################
+say "🐳 Instaluję Docker CE (get.docker.com)..."
+
+curl -fsSL https://get.docker.com | sh
 
 systemctl enable docker
 systemctl start docker
 
-### 2) Katalog bazowy
+say "✅ Docker działa: $(docker --version)"
+
+###############################################################################
+# 2) Katalogi
+###############################################################################
 BASE="/root/quantus-dirac"
 DATA="$BASE/data"
 
 mkdir -p "$BASE" "$DATA"
-
 cd "$BASE"
 
-say "📁 Katalog bazowy: $BASE"
-
-### 3) Pobieranie quantus-node (DIRAC v0.4.2)
+###############################################################################
+# 3) quantus-node v0.4.2
+###############################################################################
 NODE_URL="https://github.com/Quantus-Network/chain/releases/download/v0.4.2/quantus-node-v0.4.2-x86_64-unknown-linux-gnu.tar.gz"
-NODE_TAR="node.tar.gz"
 
-say "⬇️ Pobieram quantus-node v0.4.2..."
-curl -L "$NODE_URL" -o "$NODE_TAR"
-tar xzf "$NODE_TAR"
-
-if [[ ! -f "quantus-node" ]]; then
-  say "❌ Błąd: nie znaleziono binarki quantus-node po rozpakowaniu!"
-  exit 1
-fi
+say "⬇️ Pobieram quantus-node..."
+curl -L "$NODE_URL" -o node.tar.gz
+tar xzf node.tar.gz
 
 install -m 755 quantus-node /usr/local/bin/quantus-node
-say "✅ Zainstalowano quantus-node"
 
-### 4) Pobieranie quantus-miner (v0.3.0)
+###############################################################################
+# 4) quantus-miner v0.3.0
+###############################################################################
 MINER_URL="https://github.com/Quantus-Network/quantus-miner/releases/download/v0.3.0/quantus-miner-linux-x86_64"
 
-say "⬇️ Pobieram quantus-miner v0.3.0..."
+say "⬇️ Pobieram quantus-miner..."
 curl -L "$MINER_URL" -o quantus-miner
 chmod +x quantus-miner
 install -m 755 quantus-miner /usr/local/bin/quantus-miner
 
-say "✅ Zainstalowano quantus-miner"
-
-### 5) Adres nagród — zgodnie z MINING.md
-say ""
-say "💰 KONFIGURACJA ADRESU NAGRÓD (wg MINING.md)"
-read -rp "👉 Masz już adres qz...? (t/n): " HAVE
-
-REWARD_ADDR=""
+###############################################################################
+# 5) Rewards address (zgodne z MINING.md)
+###############################################################################
+say "💰 Czy masz adres qz...? (t/n)"
+read HAVE
 
 if [[ "$HAVE" =~ ^[TtYy]$ ]]; then
-  read -rp "👉 Wklej adres qz...: " REWARD_ADDR
+    read -rp "👉 Podaj adres qz...: " REWARD
 else
-  say "🪙 Generuję nowy adres: quantus-node key quantus..."
-  KEYFILE="$BASE/keys_rewards_$(date +%F_%H-%M-%S).txt"
+    say "🪙 Generuję seed + address (quantus-node key quantus)..."
+    KEYFILE="$BASE/keys_$(date +%F_%H-%M-%S).txt"
 
-  # NIE Dilithium – tylko SR25519 (mining.md)
-  quantus-node key quantus | tee "$KEYFILE"
+    quantus-node key quantus | tee "$KEYFILE"
 
-  REWARD_ADDR=$(grep '^Address:' "$KEYFILE" | awk '{print $2}')
-  PHRASE=$(grep '^Phrase:' "$KEYFILE" | cut -d':' -f2-)
+    REWARD=$(grep '^Address:' "$KEYFILE" | awk '{print $2}')
+    PHRASE=$(grep '^Phrase:' "$KEYFILE" | cut -d':' -f2-)
 
-  if [[ -z "$REWARD_ADDR" ]]; then
-    say "❌ Nie udało się wyciągnąć Address: z $KEYFILE"
-    exit 1
-  fi
-
-  say "📄 Klucze zapisane w: $KEYFILE"
-  say "   Address: $REWARD_ADDR"
-  say "   SEED (24 słowa): $PHRASE"
-
-  read -rp "👉 Czy zapisałeś SEED w bezpiecznym miejscu? (t/n): " OK
-  [[ "$OK" =~ ^[TtYy]$ ]] || { say "❌ Anulowano"; exit 1; }
+    say "📁 Klucze zapisane w $KEYFILE"
+    say "   Address: $REWARD"
+    say "   Seed: $PHRASE"
 fi
 
-say "ℹ️ Używam address: $REWARD_ADDR"
+say "ℹ️ Używam address: $REWARD"
 
-### 6) Nazwa noda
-read -rp "👉 Podaj nazwę noda (np. C01): " NODE_NAME
+###############################################################################
+# 6) Node name
+###############################################################################
+read -rp "👉 Nazwa noda (np. C01): " NAME
 
-### 7) Liczba workerów minera
-CPUS=$(nproc)
-WORKERS=$((CPUS>1 ? CPUS-1 : 1))
+###############################################################################
+# 7) Worker count
+###############################################################################
+CPU=$(nproc)
+WORKERS=$((CPU>1 ? CPU-1 : 1))
 
-say "⚙️ Miner workers: $WORKERS (CPU: $CPUS)"
-
-### 8) Tworzenie docker-compose.yml
+###############################################################################
+# 8) Tworzenie docker-compose.yml
+###############################################################################
 cat > docker-compose.yml <<EOF
 services:
   quantus-node:
@@ -118,8 +112,8 @@ services:
     command: >
       --base-path /var/lib/quantus
       --chain dirac
-      --name $NODE_NAME
-      --rewards-address $REWARD_ADDR
+      --name $NAME
+      --rewards-address $REWARD
       --execution native-else-wasm
       --wasm-execution compiled
       --db-cache 2048
@@ -147,15 +141,14 @@ services:
       - quantus-node
 EOF
 
-### 9) Start
-say "🚀 Uruchamiam Docker Compose..."
+###############################################################################
+# 9) Start
+###############################################################################
 docker compose down || true
 docker compose up -d
 
 say ""
-say "✅ GOTOWE!"
-say "   Dane:     $BASE/data"
-say "   Node:     docker logs -f quantus-node"
-say "   Miner:    docker logs -f quantus-miner"
-say ""
-say "🌐 Po kilku minutach powinno być widać peery + joby miningowe."
+say "🎉 GOTOWE!"
+say "   Node logs : docker logs -f quantus-node"
+say "   Miner logs: docker logs -f quantus-miner"
+say "----------------------------------------------"
