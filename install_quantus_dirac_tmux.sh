@@ -1,181 +1,181 @@
 #!/usr/bin/env bash
 # install_quantus_dirac_tmux.sh
-# Instalacja Quantus Dirac (Dirac v0.4.2) + external miner (miner-cli 1.0.0) w jednym tmux (node + miner jednocześnie)
+# Instalacja Quantus Dirac (node + external miner) na tmux, bez Dockera.
+# - pyta o nazwę noda
+# - pyta o adres nagród
+# - pobiera quantus-node v0.4.2 (Dirac)
+# - pobiera quantus-miner (miner-cli 1.0.0+aa9e7ca5 – URL możesz podmienić)
+# - generuje node_key (jeśli brak)
+# - tworzy run-node.sh i run-miner.sh
+# - uruchamia w tmux (sesja: quantus, okna: node/miner)
 
 set -euo pipefail
 
 BASE_DIR="/root/quantus-dirac"
-DATA_DIR="$BASE_DIR/data"
-SESSION_NAME="quantus"
+BIN_NODE="$BASE_DIR/quantus-node"
+BIN_MINER="$BASE_DIR/quantus-miner"
+CHAIN_DIR="$BASE_DIR/chain_data_dir"
+NODE_KEY_FILE="$BASE_DIR/node_key"
 
-NODE_BIN="$BASE_DIR/quantus-node"
-MINER_BIN="$BASE_DIR/quantus-miner"
-
+# ⚠️ PODMIENISZ W RAZIE CZEGO JEŚLI LINKI SIĘ ZMIENIĄ:
 NODE_URL="https://github.com/Quantus-Network/chain/releases/download/v0.4.2/quantus-node-v0.4.2-x86_64-unknown-linux-gnu.tar.gz"
 MINER_URL="https://github.com/Quantus-Network/quantus-miner/releases/download/v1.0.0/quantus-miner-linux-x86_64"
 
 if [[ "$EUID" -ne 0 ]]; then
-  echo "❌ Uruchom skrypt jako root (sudo su)."
+  echo "❌ Uruchom skrypt jako root: sudo bash install_quantus_dirac_tmux.sh"
   exit 1
 fi
 
-echo "🚀 Instalacja Quantus Dirac (node + external miner w tmux)"
-echo "   BASE_DIR: $BASE_DIR"
+echo "🚀 Instalacja Quantus Dirac (node + external miner) na tmux"
+echo "   Katalog bazowy: $BASE_DIR"
 echo
 
-echo "📦 Instaluję wymagane pakiety (curl, wget, tmux, ca-certificates, jq)..."
-apt-get update -y
-apt-get install -y curl wget tmux ca-certificates jq
+# 1) Pytanie o nazwę noda
+read -rp "👉 Podaj nazwę noda (np. Mi3): " NODE_NAME
+if [[ -z "${NODE_NAME}" ]]; then
+  echo "❌ Nazwa noda nie może być pusta."
+  exit 1
+fi
 
-echo "🧹 Zabijam stare procesy quantus-node / quantus-miner / tmux..."
-pkill -f quantus-node 2>/dev/null || true
-pkill -f quantus-miner 2>/dev/null || true
-tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+# 2) Pytanie o adres nagród
+read -rp "👉 Podaj adres nagród (qz...): " REWARDS_ADDRESS
+if [[ -z "${REWARDS_ADDRESS}" ]]; then
+  echo "❌ Adres nagród nie może być pusty."
+  exit 1
+fi
 
-mkdir -p "$BASE_DIR" "$DATA_DIR"
+if [[ ! "${REWARDS_ADDRESS}" =~ ^qz ]]; then
+  echo "❌ Adres nagród musi zaczynać się od 'qz'."
+  exit 1
+fi
+
+echo
+echo "📋 Podsumowanie:"
+echo "  🏷️  Node name:      ${NODE_NAME}"
+echo "  💰 Rewards address: ${REWARDS_ADDRESS}"
+echo "  📂 BASE_DIR:        ${BASE_DIR}"
+echo
+
+# 3) Pakiety
+echo "📦 Instaluję wymagane pakiety (curl, wget, tmux, ca-certificates)..."
+apt-get update -y >/dev/null
+apt-get install -y curl wget tmux ca-certificates >/dev/null
+
+# 4) Katalogi
+echo "📁 Tworzę katalog: $BASE_DIR"
+mkdir -p "$BASE_DIR"
+mkdir -p "$CHAIN_DIR"
+
+# 5) Zabijamy stare procesy / tmux
+echo "🧹 Zabijam stare procesy Quantus (jeśli są)..."
+pkill -f "$BIN_NODE" 2>/dev/null || true
+pkill -f "$BIN_MINER" 2>/dev/null || true
+tmux kill-session -t quantus 2>/dev/null || true
+
 cd "$BASE_DIR"
 
-##########################
-# NODE (v0.4.2)
-##########################
-echo "⬇️ Sprawdzam binarkę quantus-node..."
-if [[ ! -x "$NODE_BIN" ]]; then
-  echo "   Pobieram quantus-node v0.4.2..."
-  TMP_TAR="$(mktemp /tmp/quantus-node.XXXXX.tar.gz)"
-  curl -L -o "$TMP_TAR" "$NODE_URL"
-  tar -xzf "$TMP_TAR"
-  rm -f "$TMP_TAR"
-  chmod +x quantus-node
-  echo "   ✅ quantus-node gotowy."
+# 6) Pobieramy quantus-node, jeśli go nie ma
+if [[ ! -x "$BIN_NODE" ]]; then
+  echo "⬇️ Pobieram quantus-node (Dirac v0.4.2)..."
+  rm -f node.tar.gz
+  wget -O node.tar.gz "$NODE_URL"
+  tar xzf node.tar.gz
+  # Zazwyczaj w tarze jest plik 'quantus-node' w bieżącym katalogu
+  if [[ ! -f "$BIN_NODE" && -f "./quantus-node" ]]; then
+    mv ./quantus-node "$BIN_NODE"
+  fi
+  chmod +x "$BIN_NODE"
 else
-  echo "   ℹ️ quantus-node już istnieje – pomijam pobieranie."
+  echo "ℹ️ quantus-node już istnieje: $BIN_NODE"
 fi
 
-##########################
-# MINER (v1.0.0)
-##########################
-echo "⬇️ Sprawdzam binarkę quantus-miner (miner-cli 1.0.0)..."
-if [[ ! -x "$MINER_BIN" ]]; then
-  echo "   Pobieram quantus-miner v1.0.0..."
-  curl -L -o "$MINER_BIN" "$MINER_URL"
-  chmod +x "$MINER_BIN"
-  echo "   ✅ quantus-miner (miner-cli 1.0.0) gotowy."
+# 7) Pobieramy quantus-miner (miner-cli 1.0.0...) jeśli go nie ma
+if [[ ! -x "$BIN_MINER" ]]; then
+  echo "⬇️ Pobieram quantus-miner (miner-cli 1.0.0+aa9e7ca5)..."
+  rm -f quantus-miner
+  wget -O "$BIN_MINER" "$MINER_URL"
+  chmod +x "$BIN_MINER"
 else
-  echo "   ℹ️ quantus-miner już istnieje – pomijam pobieranie."
+  echo "ℹ️ quantus-miner już istnieje: $BIN_MINER"
 fi
 
-##########################
-# Nazwa noda
-##########################
-read -rp "👉 Podaj nazwę noda [MiX]: " NODE_NAME
-NODE_NAME="${NODE_NAME:-MiX}"
-
-##########################
-# Adres nagród
-##########################
-REWARDS=""
-read -rp "👉 Masz już adres nagród qz...? [t/N]: " HAVE_ADDR
-HAVE_ADDR="${HAVE_ADDR:-N}"
-
-if [[ "$HAVE_ADDR" =~ ^[TtYy]$ ]]; then
-  read -rp "👉 Wklej adres nagród (qz...): " REWARDS
-  if [[ -z "$REWARDS" ]]; then
-    echo "❌ Nie podano adresu nagród."
-    exit 1
-  fi
-  if [[ ! "$REWARDS" =~ ^qz ]]; then
-    echo "❌ Adres nagród musi zaczynać się od 'qz'."
-    exit 1
-  fi
-else
-  KEY_FILE="$BASE_DIR/keys_dirac_$(date +%F_%H%M%S).txt"
-  echo
-  echo "💰 Generuję NOWY seed + adres nagród (key quantus)..."
-  "$NODE_BIN" key quantus | tee "$KEY_FILE"
-  chmod 600 "$KEY_FILE"
-  REWARDS="$(awk '/Address:/ {print $2; exit}' "$KEY_FILE" || true)"
-
-  if [[ -z "$REWARDS" ]]; then
-    echo "❌ Nie udało się odczytać Address: z $KEY_FILE"
-    exit 1
-  fi
-
-  echo
-  echo "⚠️ SEED + ADDRESS zapisane w: $KEY_FILE"
-  echo "   ZRÓB BACKUP tego pliku (offline, password manager, kartka)."
-  read -rp "👉 Czy zapisałeś seed w bezpiecznym miejscu? [t/N]: " CONFIRM_SEED
-  CONFIRM_SEED="${CONFIRM_SEED:-N}"
-  if [[ ! "$CONFIRM_SEED" =~ ^[TtYy]$ ]]; then
-    echo "❌ Nie potwierdzono zapisu seedu. Instalacja przerwana."
-    exit 1
-  fi
-fi
-
-##########################
-# node_key
-##########################
-NODEKEY="$DATA_DIR/node_key"
-if [[ -f "$NODEKEY" ]]; then
-  echo "ℹ️ node_key już istnieje: $NODEKEY"
-else
+# 8) Generujemy node_key, jeśli brak
+if [[ ! -f "$NODE_KEY_FILE" ]]; then
   echo "🔑 Generuję node_key..."
-  "$NODE_BIN" key generate-node-key --file "$NODEKEY"
-  echo "   ✅ node_key zapisany w: $NODEKEY"
+  "$BIN_NODE" key generate-node-key --file "$NODE_KEY_FILE"
+  echo "✅ node_key zapisany w: $NODE_KEY_FILE"
+else
+  echo "ℹ️ node_key już istnieje: $NODE_KEY_FILE"
 fi
 
-chmod 700 "$DATA_DIR"
+# 9) Tworzymy run-node.sh
+cat > "$BASE_DIR/run-node.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$BASE_DIR"
 
-##########################
-# Wątki minera
-##########################
-CPU=$(nproc)
-WORKERS=$(( CPU>1 ? CPU-1 : 1 ))
-echo "🧮 CPU: $CPU, ustalam workers dla minera: $WORKERS"
+exec "$BIN_NODE" \\
+  --validator \\
+  --chain dirac \\
+  --base-path "$CHAIN_DIR" \\
+  --node-key-file "$NODE_KEY_FILE" \\
+  --rewards-address "$REWARDS_ADDRESS" \\
+  --name "$NODE_NAME" \\
+  --unsafe-rpc-external \\
+  --rpc-cors all \\
+  --in-peers 256 \\
+  --out-peers 256 \\
+  --prometheus-port 9616 \\
+  --rpc-port 9944 \\
+  --external-miner-url "http://127.0.0.1:9833/"
+EOF
 
-##########################
-# Start tmux: jedno okno, 2 panele (node + miner)
-##########################
-echo
-echo "🖥️ Uruchamiam tmux session '$SESSION_NAME' (góra node, dół miner)..."
+chmod +x "$BASE_DIR/run-node.sh"
 
-tmux new-session -d -s "$SESSION_NAME" -n main \
-  "cd $BASE_DIR && ./quantus-node \
-    --validator \
-    --chain dirac \
-    --base-path $DATA_DIR \
-    --node-key-file $NODEKEY \
-    --rewards-address $REWARDS \
-    --name $NODE_NAME \
-    --db-cache 2048 \
-    --unsafe-rpc-external \
-    --rpc-cors all \
-    --in-peers 256 \
-    --out-peers 256 \
-    --external-miner-url http://127.0.0.1:9833 \
-    --prometheus-port 9616 \
-    --rpc-port 9944"
+# 10) Tworzymy run-miner.sh
+#    Używamy (nproc - 1), minimum 1 worker
+WORKERS=1
+CPU_TOTAL=\$(nproc || echo 1)
+if [[ "\$CPU_TOTAL" -gt 1 ]]; then
+  WORKERS=\$((CPU_TOTAL - 1))
+fi
 
-tmux split-window -v -t "$SESSION_NAME:0" \
-  "cd $BASE_DIR && ./quantus-miner \
-    --engine cpu-fast \
-    --port 9833 \
-    --workers $WORKERS"
+cat > "$BASE_DIR/run-miner.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$BASE_DIR"
 
-tmux select-layout -t "$SESSION_NAME:0" tiled >/dev/null 2>&1 || true
+echo "⛏️ Startuję quantus-miner z \$WORKERS worker(s)..."
+exec "$BIN_MINER" \\
+  --engine cpu-fast \\
+  --port 9833 \\
+  --workers \$WORKERS
+EOF
+
+chmod +x "$BASE_DIR/run-miner.sh"
+
+# 11) Start w tmux: sesja 'quantus', okno 0: node, okno 1: miner
+echo "🎛  Uruchamiam node + miner w tmux (sesja: quantus)..."
+tmux new-session -d -s quantus "bash $BASE_DIR/run-node.sh"
+tmux new-window  -t quantus:1 -n miner "bash $BASE_DIR/run-miner.sh"
 
 echo
-echo "✅ Node + miner uruchomione w tmux (session: $SESSION_NAME)"
+echo "✅ Gotowe!"
 echo
-echo "🔌 Dołączenie do sesji:"
-echo "   tmux attach -t $SESSION_NAME"
+echo "📌 Jak używać:"
+echo "  • Podejrzyj sesje tmux:   tmux ls"
+echo "  • Wejdź w logi noda:      tmux attach -t quantus   (okno 0: node)"
+echo "  • Przełącz na minera:     Ctrl+B, potem 1"
+echo "  • Wyjście z tmux bez stopu:  Ctrl+B, potem D"
 echo
-echo "   Góra: node, dół: miner"
-echo "   Wyjście (bez zatrzymywania): CTRL+B, potem D"
+echo "🔁 Jeśli chcesz zmienić nazwę noda lub adres nagród:"
+echo "  1) Uruchom skrypt ponownie: bash install_quantus_dirac_tmux.sh"
+echo "  2) Podać nową nazwę / adres"
+echo "  3) Skrypt zabije stare procesy, nadpisze run-node.sh/run-miner.sh i wystartuje wszystko od nowa."
 echo
-echo "🔍 Szybki health-check:"
-echo "   curl -s -H 'Content-Type: application/json' \\"
-echo "        -d '{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"system_health\",\"params\":[]}' \\"
-echo "        http://127.0.0.1:9944 | jq"
+echo "🔍 Szybki health-check RPC:"
+echo "  curl -s -H \"Content-Type: application/json\" \\"
+echo "    -d '{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"system_health\",\"params\":[]}' \\"
+echo "    http://127.0.0.1:9944 | jq"
 echo
-echo "Szukaj w logach noda m.in.:"
-echo "   peers > 0,  'Using provided rewards address',  'Successfully mined and submitted a new block'"
+echo "ℹ️ Pamiętaj, żeby ewentualnie dopisać bootnodes do run-node.sh, jeśli będziesz chciał wymusić więcej peers."
