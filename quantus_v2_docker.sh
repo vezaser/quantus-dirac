@@ -7,7 +7,7 @@ need_root() {
   if [[ "$(id -u)" -ne 0 ]]; then
     say "❌ Uruchom jako root!"
     exit 1
-  fi
+  }
 }
 
 need_root
@@ -16,24 +16,24 @@ say "🚀 Quantus DIRAC — instalacja NODE + MINER (Docker)"
 say "-----------------------------------------------------"
 
 ###############################################################################
-# 0) Usuwamy WSZYSTKO, co powoduje konflikt (docker.io, containerd.io)
+# 1) Sprawdzenie czy Docker już jest zainstalowany
 ###############################################################################
-say "🧹 Czyszczę stare pakiety docker.io / containerd..."
+if command -v docker >/dev/null 2>&1; then
+    say "🐳 Docker już jest zainstalowany: $(docker --version)"
+    say "✔ Pomijam instalację Dockera."
+else
+    say "🐳 Instaluję Docker CE (get.docker.com)..."
 
-apt-get remove -y docker.io docker-compose-plugin containerd.io containerd runc || true
-apt-get autoremove -y || true
+    # usuwamy ewentualne konflikty
+    apt-get remove -y docker.io docker-compose-plugin containerd.io containerd runc || true
+    apt-get autoremove -y || true
 
-###############################################################################
-# 1) Instalacja Docker CE (tylko z get.docker.com)
-###############################################################################
-say "🐳 Instaluję Docker CE (get.docker.com)..."
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable docker
+    systemctl start docker
 
-curl -fsSL https://get.docker.com | sh
-
-systemctl enable docker
-systemctl start docker
-
-say "✅ Docker działa: $(docker --version)"
+    say "✔ Docker zainstalowany: $(docker --version)"
+fi
 
 ###############################################################################
 # 2) Katalogi
@@ -66,25 +66,44 @@ chmod +x quantus-miner
 install -m 755 quantus-miner /usr/local/bin/quantus-miner
 
 ###############################################################################
-# 5) Rewards address (zgodne z MINING.md)
+# 5) Rewards address (zgodnie z MINING.md)
 ###############################################################################
 say "💰 Czy masz adres qz...? (t/n)"
 read HAVE
 
 if [[ "$HAVE" =~ ^[TtYy]$ ]]; then
     read -rp "👉 Podaj adres qz...: " REWARD
+
 else
     say "🪙 Generuję seed + address (quantus-node key quantus)..."
+
     KEYFILE="$BASE/keys_$(date +%F_%H-%M-%S).txt"
 
+    # WYŁĄCZAMY set -e na chwilę
+    set +e
     quantus-node key quantus | tee "$KEYFILE"
+    STATUS=$?
+    set -e
+
+    if [[ $STATUS -ne 0 ]]; then
+        say "❌ Błąd podczas generowania klucza!"
+        exit 1
+    fi
 
     REWARD=$(grep '^Address:' "$KEYFILE" | awk '{print $2}')
     PHRASE=$(grep '^Phrase:' "$KEYFILE" | cut -d':' -f2-)
 
-    say "📁 Klucze zapisane w $KEYFILE"
+    if [[ -z "$REWARD" ]]; then
+        say "❌ Nie udało się wyciągnąć Address: z $KEYFILE"
+        exit 1
+    fi
+
+    say "📄 Klucze zapisane w $KEYFILE"
     say "   Address: $REWARD"
-    say "   Seed: $PHRASE"
+    say "   Seed (24 wyrazy):$PHRASE"
+
+    read -rp "👉 Czy zapisałeś SEED? (t/n): " OK
+    [[ "$OK" =~ ^[TtYy]$ ]] || { say "❌ Anulowano"; exit 1; }
 fi
 
 say "ℹ️ Używam address: $REWARD"
