@@ -3,8 +3,9 @@ set -euo pipefail
 
 ###
 #  Quantus DIRAC – instalacja node + miner (bez Dockera)
-#  Wersja poprawiona – w pełni zgodna z MINING.md
-#  UWZGLĘDNIA brakujący protoc → protobuf-compiler
+#  - Budowa z kodu (MINING.md)
+#  - Automatyczne wygenerowanie node_key (P2P)
+#  - Automatyczne wygenerowanie adresu nagród (jeśli trzeba)
 ###
 
 RED="\e[31m"
@@ -25,7 +26,6 @@ fi
 
 echo "------------------------------------------------------"
 echo -e "🚀 ${GRN}Quantus DIRAC – instalacja node + miner (bez Dockera)${RST}"
-echo "    (pełna zgodność z MINING.md)"
 echo "------------------------------------------------------"
 
 ### 1. Pakiety systemowe
@@ -34,13 +34,9 @@ log "Instaluję pakiety systemowe..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 
-# 🔥 ADDED protobuf-compiler (protoc)
 apt-get install -y \
   build-essential pkg-config libssl-dev clang cmake git curl wget ca-certificates tmux \
   protobuf-compiler
-
-# Dodatkowe narzędzia przydatne do protobu
-apt-get install -y unzip || true
 
 ok "Pakiety zainstalowane."
 
@@ -52,7 +48,7 @@ else
   ok "Rust już jest – pomijam instalację."
 fi
 
-# Załaduj środowisko Rust
+# załaduj środowisko Rust
 source "$HOME/.cargo/env"
 
 log "Ustawiam Rust nightly..."
@@ -66,6 +62,7 @@ BASE="/root/quantus-src"
 CHAIN="${BASE}/chain"
 MINER="${BASE}/quantus-miner"
 DATA="/var/lib/quantus"
+NODE_KEY_FILE="${DATA}/node_key"
 
 mkdir -p "$BASE"
 mkdir -p "$DATA"
@@ -84,22 +81,29 @@ fi
 
 ### 5. Budowa quantus-node
 log "Buduję quantus-node..."
-
 cd "$CHAIN"
 
-# 🔥 ADDED: walidacja protoc
 if ! command -v protoc >/dev/null 2>&1; then
-  err "Brak protoc! Mimo instalacji protobuf-compiler."
-  err "Spróbuj: apt-get install protobuf-compiler"
+  err "Brak protoc mimo zainstalowanego protobuf-compiler."
+  err "Sprawdź: apt-get install protobuf-compiler"
   exit 1
 fi
 
 cargo build --release -p quantus-node
-
 install -Dm755 "$CHAIN/target/release/quantus-node" /usr/local/bin/quantus-node
 ok "quantus-node zainstalowany."
 
-### 6. Pobranie i budowa quantus-miner
+### 6. AUTOMATYCZNE GENEROWANIE node_key (P2P)
+if [[ -f "$NODE_KEY_FILE" ]]; then
+  ok "Node key już istnieje: $NODE_KEY_FILE – nie generuję nowego."
+else
+  log "Brak node_key – generuję nowy P2P identity:"
+  log "  quantus-node key generate-node-key --file $NODE_KEY_FILE"
+  /usr/local/bin/quantus-node key generate-node-key --file "$NODE_KEY_FILE"
+  ok "Node key zapisany w: $NODE_KEY_FILE"
+fi
+
+### 7. Pobranie i budowa quantus-miner
 if [[ ! -d "$MINER" ]]; then
   log "Klonuję quantus-miner..."
   git clone https://github.com/Quantus-Network/quantus-miner.git "$MINER"
@@ -111,22 +115,19 @@ fi
 log "Buduję quantus-miner..."
 cd "$MINER"
 cargo build --release
-
 install -Dm755 "$MINER/target/release/quantus-miner" /usr/local/bin/quantus-miner
 ok "quantus-miner zainstalowany."
 
-### 7. Nazwa noda
+### 8. Nazwa noda
 echo
 read -rp "👉 Podaj nazwę swojego noda (np. C01, Q20): " NODE_NAME
 NODE_NAME=${NODE_NAME:-"QuantusNode"}
-
 ok "Nazwa noda: $NODE_NAME"
 
-### 8. Adres do nagród
+### 9. Adres do nagród
 echo
 read -rp "👉 Czy masz już adres do nagród (qz...) ? (t/n): " HAS_ADDR
 HAS_ADDR=${HAS_ADDR,,}
-
 REWARDS_ADDR=""
 
 if [[ "$HAS_ADDR" == "t" ]]; then
@@ -134,15 +135,11 @@ if [[ "$HAS_ADDR" == "t" ]]; then
 else
   warn "Generuję nowy 24-słowowy seed + adres przez:"
   echo "     quantus-node key quantus"
-
   KEYFILE="/root/quantus_key_$(date +%Y%m%d_%H%M%S).txt"
-
   /usr/local/bin/quantus-node key quantus | tee "$KEYFILE"
-
   echo
   ok "Zapisano do pliku: $KEYFILE"
   warn "ZAPISZ SEED (24 słowa) oraz adres!!!"
-
   while true; do
     read -rp "👉 Czy skopiowałeś seed i adres? (t/n): " OKCOP
     OKCOP=${OKCOP,,}
@@ -162,17 +159,15 @@ fi
 
 ok "Używam adresu nagród: $REWARDS_ADDR"
 
-### 9. Miner — liczba workerów
+### 10. Worker threads dla minera
 CPU=$(nproc)
 DEF=$((CPU>1?CPU-1:1))
-
 read -rp "👉 Wykryto $CPU rdzeni. Ile workerów ma mieć miner? [domyślnie $DEF]: " W_IN
 WORKERS=${W_IN:-$DEF}
-
 ok "Miner będzie miał $WORKERS workerów."
 
-### 10. Systemd – Node
-log "Tworzę service /etc/systemd/system/quantus-node.service"
+### 11. Systemd – Node
+log "Tworzę /etc/systemd/system/quantus-node.service"
 
 cat >/etc/systemd/system/quantus-node.service <<EOF
 [Unit]
@@ -186,7 +181,7 @@ ExecStart=/usr/local/bin/quantus-node \\
   --validator \\
   --chain dirac \\
   --base-path /var/lib/quantus \\
-  --node-key-file /var/lib/quantus/node_key \\
+  --node-key-file ${NODE_KEY_FILE} \\
   --rewards-address ${REWARDS_ADDR} \\
   --name ${NODE_NAME} \\
   --execution native-else-wasm \\
@@ -204,8 +199,8 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-### 11. Systemd – Miner
-log "Tworzę service /etc/systemd/system/quantus-miner.service"
+### 12. Systemd – Miner
+log "Tworzę /etc/systemd/system/quantus-miner.service"
 
 cat >/etc/systemd/system/quantus-miner.service <<EOF
 [Unit]
@@ -222,13 +217,11 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-### 12. Start
+### 13. Start usług
 log "Uruchamiam usługi..."
-
 systemctl daemon-reload
 systemctl enable quantus-node quantus-miner
 systemctl restart quantus-node quantus-miner
-
 ok "Node i Miner uruchomione!"
 
 echo
