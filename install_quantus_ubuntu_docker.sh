@@ -4,42 +4,36 @@ set -euo pipefail
 say() { echo -e "$*"; }
 
 # ----------------------------------------
-#  AUTOMATYCZNA INSTALACJA DOCKERA (Ubuntu / Debian)
+#  AUTOMATYCZNA INSTALACJA DOCKERA (uniwersalna - Ubuntu/Debian/Fedora/Rocky/Alma/CentOS)
 # ----------------------------------------
 install_docker() {
-  say "🐳 Instaluję Docker (Ubuntu/Debian)..."
+  say "🐳 Instaluję Docker (get.docker.com)..."
 
-  if ! command -v apt-get >/dev/null 2>&1; then
-    say "❌ Ten instalator jest przeznaczony dla Ubuntu/Debian (apt-get nie znaleziono)."
-    exit 1
+  # Upewnij się, że jest curl
+  if ! command -v curl >/dev/null 2>&1; then
+    say "ℹ️ Brak curl – instaluję..."
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update -y
+      apt-get install -y curl
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y curl
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y curl
+    else
+      say "❌ Nie mogę zainstalować curl (brak apt/dnf/yum). Zainstaluj curl ręcznie i uruchom skrypt ponownie."
+      exit 1
+    fi
   fi
 
-  apt-get update -y
-  apt-get install -y \
-    ca-certificates \
-    curl \
-    gnupg \
-    lsb-release
+  # Oficjalny skrypt Dockera – działa na większości dystrybucji
+  curl -fsSL https://get.docker.com | sh
 
-  install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL "https://download.docker.com/linux/$(. /etc/os-release && echo "$ID")/gpg" \
-    -o /etc/apt/keyrings/docker.gpg
-  chmod a+r /etc/apt/keyrings/docker.gpg
-
-  echo \
-"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-https://download.docker.com/linux/$(. /etc/os-release && echo "$ID") \
-$(lsb_release -cs) stable" \
-    > /etc/apt/sources.list.d/docker.list
-
-  apt-get update -y
-  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
+  # Włącz usługę docker
   if command -v systemctl >/dev/null 2>&1; then
     systemctl enable --now docker || true
   fi
 
-  say "✅ Docker zainstalowany."
+  say "✅ Docker zainstalowany (get.docker.com)."
 }
 
 # Jeśli Docker nie jest zainstalowany → instaluj
@@ -54,17 +48,17 @@ say "✔️ Docker wykryty: $(docker --version 2>/dev/null || echo OK)"
 docker_compose() {
   if docker compose version >/dev/null 2>&1; then
     docker compose "$@"
-  elif command -v docker-compose >/dev/null 2>&1; then
+  elif command -v docker-compose >/devnull 2>&1; then
     docker-compose "$@"
   else
     say "❌ Nie znaleziono docker compose ani docker-compose."
-    say "Zainstaluj Docker Compose i spróbuj ponownie."
+    say "Zainstaluj Docker Compose (plugin lub binary) i spróbuj ponownie."
     exit 1
   fi
 }
 
-say "🚀 Quantus (DIRAC) — Node + Miner w Dockerze (Ubuntu/Debian)"
-say "------------------------------------------------------------"
+say "🚀 Quantus (DIRAC) — Node + Miner w Dockerze (ALL-IN-ONE)"
+say "---------------------------------------------------------"
 
 # 0) Sprzątanie
 say "🧹 Czyszczę stare kontenery/obrazy..."
@@ -78,7 +72,7 @@ WORKDIR="/root/quantus-dirac"
 mkdir -p "$WORKDIR/quantus_node_data"
 cd "$WORKDIR"
 
-# 2) Pytania
+# 2) Pytania o node + adres
 read -rp "👉 Podaj nazwę swojego noda (np. C01): " NODE_NAME
 read -rp "👉 Czy masz adres do nagród? (t/n): " HAVE_ADDR
 
@@ -126,7 +120,7 @@ docker build -f Dockerfile.miner -t local/quantus-miner:latest --build-arg MINER
 CPUS=$(nproc 2>/dev/null || echo 2)
 WORKERS=$(( CPUS>1 ? CPUS-1 : 1 ))
 
-# 5) docker-compose.yml (UWAGA: bez --node-key-file)
+# 5) docker-compose.yml (UWAGA: bez --node-key-file!)
 cat > docker-compose.yml <<EOF
 services:
   quantus-node:
@@ -178,6 +172,5 @@ say "---------------------------------"
 say "🎯 GOTOWE!"
 say "   • Node: ${NODE_NAME}"
 say "   • Rewards: ${REWARD_ADDR}"
-say "   • Sprawdź: docker ps"
 say "   • Logi node:  docker logs -f quantus-node"
 say "   • Logi miner: docker logs -f quantus-miner"
