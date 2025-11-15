@@ -1,92 +1,84 @@
 #!/usr/bin/env bash
+#
+# install_quantus_dirac_compose.sh
+# Stabilna instalacja Quantus Dirac (v0.4.2)
+# - poprawiona ścieżka danych
+# - poprawione uprawnienia (brak PermissionDenied)
+# - poprawne generowanie node_key
+# - poprawne generowanie rewards-address
+# - poprawne docker-compose
+# - pełna zgodność z MINING.md
+#
+
 set -euo pipefail
 
-echo "🚀 Quantus Dirac v0.4.2 — instalacja (Docker Compose, FIXED)"
-sleep 1
-
 BASE_DIR="/root/quantus-dirac"
-DATA_DIR="$BASE_DIR/quantus_node_data"
+DATA_DIR="$BASE_DIR/data"
 IMAGE="ghcr.io/quantus-network/quantus-node:v0.4.2"
 
+mkdir -p "$BASE_DIR"
 mkdir -p "$DATA_DIR"
 
-############################################
-# 1) Sprawdzenie i instalacja Docker
-############################################
-if ! command -v docker >/dev/null 2>&1; then
-  echo "🐳 Instaluję Docker..."
-  apt-get update -y
-  apt-get install -y ca-certificates curl gnupg
-  install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-  chmod a+r /etc/apt/keyrings/docker.asc
-  . /etc/os-release
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
-  https://download.docker.com/linux/ubuntu $VERSION_CODENAME stable" \
-  > /etc/apt/sources.list.d/docker.list
-  apt-get update -y
-  apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-fi
+echo "🚀 Instalacja Quantus Dirac (v0.4.2)"
+echo "📁 Katalog: $BASE_DIR"
+echo
 
-systemctl start docker || true
+# ==============================
+# 1. POPRAWNE UPRAWNIENIA
+# ==============================
+echo "🔧 Naprawiam uprawnienia..."
+chmod -R 777 "$DATA_DIR"
 
-# docker compose wrapper
-dc() {
-  if docker compose version >/dev/null 2>&1; then
-    docker compose "$@"
-  else
-    docker-compose "$@"
-  fi
-}
+# ==============================
+# 2. NAZWA NODA
+# ==============================
+DEFAULT_NODE="Node01"
+read -rp "👉 Nazwa noda [${DEFAULT_NODE}]: " NODE_NAME
+NODE_NAME="${NODE_NAME:-$DEFAULT_NODE}"
 
-############################################
-# 2) Nazwa noda
-############################################
-read -rp "👉 Podaj nazwę noda (np. C01): " NODE_NAME
-NODE_NAME="${NODE_NAME:-Node01}"
+# ==============================
+# 3. ADRES NAGRÓD
+# ==============================
+REWARDS_ADDRESS=""
+read -rp "👉 Masz adres nagród? (t/N): " HAVE_ADDR
+HAVE_ADDR="${HAVE_ADDR:-N}"
 
-############################################
-# 3) Czy masz adres nagród?
-############################################
-read -rp "👉 Masz adres nagród qz...? [t/N]: " HAVE
-HAVE="${HAVE:-N}"
-
-if [[ "$HAVE" =~ ^[TtYy]$ ]]; then
-  read -rp "👉 Wklej adres nagród: " REWARD
-  if [[ -z "$REWARD" ]]; then
-    echo "❌ Brak adresu!"
-    exit 1
-  fi
+if [[ "$HAVE_ADDR" =~ ^[TtYy]$ ]]; then
+    read -rp "👉 Wklej adres (qz...): " REWARDS_ADDRESS
 else
-  echo "🪙 Generuję nowy adres nagród..."
-  KEYFILE="$BASE_DIR/rewards_$(date +%F_%H%M%S).txt"
+    echo "🔐 Generuję nowy adres nagród..."
+    KEY_FILE="$BASE_DIR/keys_$(date +%F_%H%M%S).txt"
 
-  docker run --rm "$IMAGE" key quantus | tee "$KEYFILE"
-  chmod 600 "$KEYFILE"
+    docker run --rm "$IMAGE" key quantus | tee "$KEY_FILE"
+    chmod 600 "$KEY_FILE"
 
-  REWARD=$(awk '/Address:/ {print $2}' "$KEYFILE")
-  echo "📌 Twój nowy adres nagród: $REWARD"
-  read -rp "👉 Czy zapisałeś seed offline? [t/N]: " OK
-  [[ "$OK" =~ ^[TtYy]$ ]] || exit 1
+    REWARDS_ADDRESS=$(awk '/Address:/ {print $2; exit}' "$KEY_FILE")
+
+    echo "📌 Adres: $REWARDS_ADDRESS"
+    read -rp "👉 Czy zapisałeś seed? (t/N): " CONFIRM
+    [[ "$CONFIRM" =~ ^[TtYy]$ ]] || { echo "❌ Przerwano."; exit 1; }
 fi
 
-############################################
-# 4) Generowanie node_key jeśli nie istnieje
-############################################
+echo "💰 Rewards-address = $REWARDS_ADDRESS"
+
+# ==============================
+# 4. GENEROWANIE NODE_KEY
+# ==============================
 if [[ ! -f "$DATA_DIR/node_key" ]]; then
-  echo "🔑 Generuję node_key..."
-  docker run --rm \
-    -v "$DATA_DIR":/var/lib/quantus \
-    "$IMAGE" \
-    key generate-node-key --file /var/lib/quantus/node_key
+    echo "🔑 Generuję node_key..."
+    docker run --rm \
+        -v "$DATA_DIR":/var/lib/quantus \
+        "$IMAGE" \
+        key generate-node-key --file /var/lib/quantus/node_key
 fi
 
 chmod 666 "$DATA_DIR/node_key"
-chmod 777 "$DATA_DIR"
 
-############################################
-# 5) Tworzenie docker-compose.yml
-############################################
+echo "📌 node_key zapisany w $DATA_DIR/node_key"
+
+# ==============================
+# 5. TWORZENIE DOCKER-COMPOSE
+# ==============================
 cat > "$BASE_DIR/docker-compose.yml" <<EOF
 services:
   quantus-node:
@@ -95,31 +87,44 @@ services:
     restart: unless-stopped
     command: >
       --validator
-      --base-path /var/lib/quantus
       --chain dirac
+      --base-path /var/lib/quantus
       --node-key-file /var/lib/quantus/node_key
-      --rewards-address $REWARD
+      --rewards-address $REWARDS_ADDRESS
       --name $NODE_NAME
       --db-cache 2048
       --unsafe-rpc-external
       --rpc-cors all
+      --in-peers 256
+      --out-peers 256
     volumes:
-      - ./quantus_node_data:/var/lib/quantus
+      - ./data:/var/lib/quantus
     ports:
       - "30333:30333"
       - "9944:9944"
 EOF
 
-############################################
-# 6) Start noda
-############################################
-cd "$BASE_DIR"
-dc down || true
-dc up -d
+echo "📄 docker-compose.yml zapisany."
 
-echo "🎉 Node uruchomiony!"
-echo "🔍 Logi:"
-echo "   docker compose logs -f quantus-node"
-echo "📂 Dane: $DATA_DIR"
-echo "🔑 Node key: $DATA_DIR/node_key"
-echo "💰 Rewards: $REWARD"
+# ==============================
+# 6. INSTALACJA DOCKERA
+# ==============================
+if ! command -v docker >/dev/null 2>&1; then
+    echo "🐳 Instaluję Docker..."
+    apt-get update -y
+    apt-get install -y docker.io docker-compose-plugin
+fi
+
+systemctl start docker || true
+
+# ==============================
+# 7. START
+# ==============================
+cd "$BASE_DIR"
+docker compose down || true
+docker compose up -d
+
+echo
+echo "🎉 Quantus Dirac uruchomiony!"
+echo "👉 Logi noda: docker compose logs -f quantus-node"
+echo "👉 Sprawdź peers > 0 i import bloków."
