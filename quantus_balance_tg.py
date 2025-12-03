@@ -31,11 +31,9 @@ DELAY_BETWEEN  = float(os.getenv("DELAY_BETWEEN", "1.8"))
 DEBUG          = os.getenv("DEBUG", "0") == "1"
 
 HISTORY_PATH   = "balances_history.json"
-# etykieta, ile minut wstecz
+
+# Okna czasowe – TYLKO 12h i 24h
 TIMEFRAMES = [
-    ("30m", 30),
-    ("1h", 60),
-    ("4h", 240),
     ("12h", 720),
     ("24h", 1440),
 ]
@@ -45,9 +43,8 @@ NUM_RE = r"(\d{1,3}(?:[ \u00A0,]\d{3})*(?:[.,]\d+)?|\d+(?:[.,]\d+)?)"
 Q_RE   = re.compile(NUM_RE + r"\s*(?:QU|QNT)\b", re.IGNORECASE)
 
 
-# ----------------- POMOCNICZE -----------------
+# ----------------- UTILS -----------------
 def normalize_num(txt: str) -> Optional[str]:
-    """Zamienia 1 234,56 / 1,234.56 -> 1234.56"""
     if not txt:
         return None
     t = txt.replace("\u00A0", " ").strip()
@@ -61,16 +58,10 @@ def normalize_num(txt: str) -> Optional[str]:
 
 
 def read_pairs_from_file(path: str) -> List[Tuple[str, str]]:
-    """
-    Czyta plik:
-      LABEL qADRES
-    Zwraca listę (label, address).
-    Jeśli plik nie istnieje -> [].
-    """
     p = Path(path)
     if not p.exists():
         return []
-    pairs: List[Tuple[str, str]] = []
+    pairs = []
     with open(p, "r") as f:
         for line in f:
             s = line.strip()
@@ -85,21 +76,7 @@ def read_pairs_from_file(path: str) -> List[Tuple[str, str]]:
 
 
 def read_groups() -> List[Tuple[str, List[Tuple[str, str]]]]:
-    """
-    Szuka nodes*.txt w katalogu i zwraca listę:
-      [(owner_name, [(label, addr)...]), ...]
-
-    owner_name nadawany wg:
-        nodes.txt      -> "Cerveza"
-        nodes2.txt     -> "Baku"
-        nodes3.txt     -> "3-Nodes"
-        nodes4.txt     -> "4-Nodes"
-        nodes5.txt     -> "5-Nodes"
-        ...
-    Pokazuje tylko sekcje dla plików, które istnieją.
-    """
-    groups: List[Tuple[str, List[Tuple[str, str]]]] = []
-
+    groups = []
     paths = sorted(glob("nodes*.txt"))
 
     special = {
@@ -112,17 +89,16 @@ def read_groups() -> List[Tuple[str, List[Tuple[str, str]]]]:
         if not pairs:
             continue
 
-        stem = Path(path).stem  # nodes, nodes2, nodes3, ...
+        stem = Path(path).stem
 
         if stem in special:
             owner = special[stem]
         else:
             m = re.match(r"nodes(\d+)", stem)
             if m:
-                num = m.group(1)
-                owner = f"{num}-Nodes"
+                owner = f"{m.group(1)}-Nodes"
             else:
-                owner = stem  # fallback
+                owner = stem
 
         groups.append((owner, pairs))
 
@@ -130,7 +106,6 @@ def read_groups() -> List[Tuple[str, List[Tuple[str, str]]]]:
 
 
 def parse_q_amount(text: str) -> Optional[str]:
-    """Zwraca 'X.Y QU' lub 'X.Y QNT' z tekstu bota."""
     if not text:
         return None
     m = Q_RE.search(text)
@@ -138,11 +113,10 @@ def parse_q_amount(text: str) -> Optional[str]:
         return None
     val = normalize_num(m.group(1))
     unit = "QU" if "QU" in m.group(0).upper() else "QNT"
-    return f"{val} {unit}" if val else None
+    return f"{val} {unit}"
 
 
 def looks_like_placeholder(text: str) -> bool:
-    """Ignoruje echo '/balance', 'Checking balance...' itd."""
     if not text:
         return True
     t = text.strip().lower()
@@ -156,7 +130,6 @@ def looks_like_placeholder(text: str) -> bool:
 
 
 def parse_balance_float(bal: str) -> float:
-    """Konwertuje '1234.56 QU' -> 1234.56 (float)."""
     if not bal or bal in ("—", "ERROR", "FloodWait"):
         return 0.0
     x = bal.replace(" QNT", "").replace(" QU", "").replace("\u00A0", " ").strip()
@@ -168,24 +141,21 @@ def parse_balance_float(bal: str) -> float:
         x = x.replace(" ", "")
     try:
         return float(x)
-    except Exception:
+    except:
         return 0.0
 
 
 # ----------------- HISTORIA -----------------
-def load_history(path: str = HISTORY_PATH) -> List[dict]:
-    """Wczytuje historię: listę wpisów {ts: ISO, balances: {node: float}}."""
+def load_history(path=HISTORY_PATH):
     try:
         with open(path, "r") as f:
             data = json.load(f)
-        entries = data.get("entries", [])
-        return entries if isinstance(entries, list) else []
-    except Exception:
+        return data.get("entries", [])
+    except:
         return []
 
 
-def save_history(entries: List[dict], path: str = HISTORY_PATH):
-    """Zapisuje historię z pruningiem do ~3 dni wstecz."""
+def save_history(entries, path=HISTORY_PATH):
     now = datetime.now()
     cutoff = now - timedelta(days=3)
     pruned = []
@@ -194,83 +164,92 @@ def save_history(entries: List[dict], path: str = HISTORY_PATH):
             dt = datetime.fromisoformat(e["ts"])
             if dt >= cutoff:
                 pruned.append(e)
-        except Exception:
-            continue
+        except:
+            pass
     with open(path, "w") as f:
         json.dump({"entries": pruned}, f, indent=2)
 
 
-def append_current_to_history(now_vals: Dict[str, float], path: str = HISTORY_PATH):
-    entries = load_history(path)
+def append_current_to_history(now_vals: Dict[str, float]):
+    entries = load_history()
     entry = {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "balances": now_vals,
     }
     entries.append(entry)
-    save_history(entries, path)
+    save_history(entries)
 
 
-def compute_deltas(
-    now_vals: Dict[str, float],
-    history: List[dict],
-    now_ts: datetime,
-) -> Dict[str, Dict[str, Optional[float]]]:
-    """
-    Zwraca: {node: { '30m': delta, '1h': delta, ... }}.
-    Jeśli brak danych dla danego okna czasowego -> None.
-    """
+def find_baseline(parsed, target: datetime):
+    baseline = None
+    for dt, balances in parsed:
+        if dt <= target:
+            baseline = balances
+        else:
+            break
+    return baseline or {}
+
+
+def compute_deltas(now_vals: Dict[str, float], history, now_ts):
     parsed = []
+    earliest_seen = {}
+
     for e in history:
         try:
             dt = datetime.fromisoformat(e["ts"])
-            balances = e.get("balances", {})
+            balances = {k: float(v) for k, v in e.get("balances", {}).items()}
             parsed.append((dt, balances))
-        except Exception:
-            continue
+            for addr in balances:
+                if addr not in earliest_seen or dt < earliest_seen[addr]:
+                    earliest_seen[addr] = dt
+        except:
+            pass
+
     parsed.sort(key=lambda x: x[0])
 
-    baselines: Dict[str, Optional[dict]] = {}
-    for label, minutes in TIMEFRAMES:
-        target = now_ts - timedelta(minutes=minutes)
-        candidate = None
-        for dt, balances in parsed:
-            if dt <= target:
-                candidate = balances
-        baselines[label] = candidate
+    baselines = {}
+    for label, mins in TIMEFRAMES:
+        target = now_ts - timedelta(minutes=mins)
+        baselines[label] = find_baseline(parsed, target)
 
     deltas: Dict[str, Dict[str, Optional[float]]] = {}
-    for node, curr_val in now_vals.items():
-        node_deltas: Dict[str, Optional[float]] = {}
-        for label, _mins in TIMEFRAMES:
-            base_balances = baselines.get(label)
-            if not base_balances or node not in base_balances:
+
+    for addr, now_val in now_vals.items():
+        node_deltas = {}
+
+        first_seen = earliest_seen.get(addr)
+        for label, mins in TIMEFRAMES:
+
+            if not first_seen or (now_ts - first_seen) < timedelta(minutes=mins):
+                node_deltas[label] = None
+                continue
+
+            base_balances = baselines.get(label, {})
+            if addr not in base_balances:
                 node_deltas[label] = None
             else:
-                prev_val = float(base_balances.get(node, 0.0))
-                node_deltas[label] = round(curr_val - prev_val, 6)
-        deltas[node] = node_deltas
+                prev_val = float(base_balances[addr])
+                node_deltas[label] = round(now_val - prev_val, 6)
+
+        deltas[addr] = node_deltas
+
     return deltas
 
 
-# ----------------- FORMATOWANIE RAPORTU -----------------
-def make_discord_text(
-    groups_with_rows: List[Tuple[str, List[Tuple[str, str, str]]]],
-    now_vals: Dict[str, float],
-    deltas: Dict[str, Dict[str, Optional[float]]],
-) -> str:
-    """Buduje raport z sekcjami per właściciel + TOTAL (ALL)."""
+# ----------------- DISCORD FORMAT -----------------
+def make_discord_messages(groups_with_rows, now_vals, deltas):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     headers = ["NODE", "BAL"] + [label for label, _ in TIMEFRAMES]
     widths = [24, 10] + [8] * len(TIMEFRAMES)
 
-    def fmt_row(cols: List[str]) -> str:
+    def fmt_row(cols):
         line = f"{cols[0]:<{widths[0]}}{cols[1]:>{widths[1]}}"
         for i in range(2, len(cols)):
             line += f"{cols[i]:>{widths[i]}}"
         return line
 
-    def fmt_delta(x: Optional[float]) -> str:
+    def fmt_delta(x):
         if x is None:
             return "-"
         if abs(x) < 1e-9:
@@ -278,79 +257,67 @@ def make_discord_text(
         sign = "+" if x > 0 else ""
         return f"{sign}{x:.1f}"
 
-    total_now_all: float = sum(now_vals.values())
-    totals_delta_all: Dict[str, float] = {label: 0.0 for label, _ in TIMEFRAMES}
-    for node, _val in now_vals.items():
-        for tf_label, _ in TIMEFRAMES:
-            v = deltas.get(node, {}).get(tf_label)
-            if v is not None:
-                totals_delta_all[tf_label] += v
+    messages = []
 
-    lines = [f"**Quantus — Balances (@QuantusFaucetBot)**  \n*{ts}*"]
-    lines.append("```")
+    for owner, rows in groups_with_rows:
 
-    for owner_name, rows in groups_with_rows:
-        lines.append(f"{owner_name}:")
+        lines = []
+        lines.append(f"**Quantus — Balances (@QuantusFaucetBot)**  \n*{ts}*")
+        lines.append(f"{owner}")
+        lines.append("```")
         lines.append(fmt_row(headers))
         lines.append("-" * sum(widths))
 
-        owner_total_now = 0.0
-        owner_totals_delta: Dict[str, float] = {label: 0.0 for label, _ in TIMEFRAMES}
+        owner_total_now = 0
+        owner_delta_total = {label: 0.0 for label, _ in TIMEFRAMES}
 
-        for label, _addr, _bal_str in rows:
-            val_now = now_vals.get(label, 0.0)
-            d = deltas.get(label, {})
+        for label, addr, _bal_str in rows:
+            val_now = now_vals.get(addr, 0.0)
+            d = deltas.get(addr, {})
 
             owner_total_now += val_now
             for tf_label, _ in TIMEFRAMES:
                 v = d.get(tf_label)
                 if v is not None:
-                    owner_totals_delta[tf_label] += v
+                    owner_delta_total[tf_label] += v
 
             cols = [label, f"{val_now:.1f}"]
             for tf_label, _ in TIMEFRAMES:
                 cols.append(fmt_delta(d.get(tf_label)))
+
             lines.append(fmt_row(cols))
 
         lines.append("-" * sum(widths))
-        total_cols = [f"TOTAL ({owner_name})", f"{owner_total_now:.1f}"]
+
+        total_cols = [f"TOTAL ({owner})", f"{owner_total_now:.1f}"]
         for tf_label, _ in TIMEFRAMES:
-            td = owner_totals_delta[tf_label]
-            if abs(td) < 1e-9:
+            v = owner_delta_total[tf_label]
+            if abs(v) < 1e-9:
                 total_cols.append("0")
             else:
-                sign = "+" if td > 0 else ""
-                total_cols.append(f"{sign}{td:.1f}")
+                sign = "+" if v > 0 else ""
+                total_cols.append(f"{sign}{v:.1f}")
+
         lines.append(fmt_row(total_cols))
-        lines.append("")
+        lines.append("```")
 
-    lines.append("-" * sum(widths))
-    all_cols = ["TOTAL (ALL)", f"{total_now_all:.1f}"]
-    for tf_label, _ in TIMEFRAMES:
-        td = totals_delta_all[tf_label]
-        if abs(td) < 1e-9:
-            all_cols.append("0")
-        else:
-            sign = "+" if td > 0 else ""
-            all_cols.append(f"{sign}{td:.1f}")
-    lines.append(fmt_row(all_cols))
+        messages.append("\n".join(lines))
 
-    lines.append("```")
-    return "\n".join(lines)
+    return messages
 
 
-def send_to_discord(webhook_url: str, content: str):
+def send_to_discord(webhook_url, content):
     if not webhook_url:
         return
     try:
-        resp = requests.post(webhook_url, json={"content": content})
-        if resp.status_code not in (200, 204):
-            console.print(f"[red]Discord webhook błąd: {resp.status_code}[/red]")
+        r = requests.post(webhook_url, json={"content": content})
+        if r.status_code not in (200, 204):
+            console.print(f"[red]Discord error: {r.status_code}[/red]")
     except Exception as e:
-        console.print(f"[red]Nie udało się wysłać na Discord: {e}[/red]")
+        console.print(f"[red]Błąd wysyłki Discord: {e}[/red]")
 
 
-def print_table(rows: List[Tuple[str, str, str]], title: str):
+def print_table(rows, title):
     tb = Table(title=title, box=box.SIMPLE_HEAVY)
     tb.add_column("Nazwa noda", style="cyan", no_wrap=True)
     tb.add_column("q-adres", style="green")
@@ -360,63 +327,49 @@ def print_table(rows: List[Tuple[str, str, str]], title: str):
     console.print(tb)
 
 
-# ----------------- TELEGRAM / BOT -----------------
-async def ask_bot_for_balance(client: TelegramClient, bot_username: str, address: str) -> str:
-    """Wysyła /balance <address> i czyta odpowiedzi bota."""
+# ----------------- TELEGRAM -----------------
+async def ask_bot_for_balance(client, bot_username, address):
     entity = await client.get_entity(bot_username)
     cmd = CMD_TEMPLATE.format(address)
 
     try:
         sent = await client.send_message(entity, cmd)
         sent_id = sent.id
-        if DEBUG:
-            console.log(f"CMD id={sent_id}: {cmd}")
 
         deadline = time.time() + REPLY_TIMEOUT
 
         while time.time() < deadline:
             msgs = await client.get_messages(entity, limit=12)
+
             for m in msgs:
                 if m.sender_id != entity.id or m.id <= sent_id:
                     continue
+
                 t = (m.message or "").strip()
                 if not t:
                     continue
-                if DEBUG:
-                    console.log(f"BOT[{m.id}]: {t}")
+
                 if looks_like_placeholder(t):
                     continue
+
                 got = parse_q_amount(t)
                 if got:
                     return got
-            await asyncio.sleep(STEP_WAIT)
 
-        msgs = await client.get_messages(entity, limit=30)
-        msgs = [m for m in msgs if m.sender_id == entity.id and m.id > sent_id]
-        msgs.sort(key=lambda x: x.id)
-        for m in msgs:
-            t = (m.message or "").strip()
-            if looks_like_placeholder(t):
-                continue
-            got = parse_q_amount(t)
-            if got:
-                return got
+            await asyncio.sleep(STEP_WAIT)
 
         return "—"
 
     except FloodWaitError as e:
-        wait_s = int(getattr(e, "seconds", 10))
-        console.print(f"[yellow]FloodWait – pauza {wait_s}s[/yellow]")
-        await asyncio.sleep(wait_s)
+        await asyncio.sleep(int(getattr(e, "seconds", 10)))
         return "FloodWait"
-    except Exception as e:
-        if DEBUG:
-            console.log(f"ERROR ask_bot_for_balance: {e}")
-        return f"ERROR: {e}"
+
+    except Exception:
+        return "ERROR"
 
 
-async def fetch_balances(client: TelegramClient, pairs: List[Tuple[str, str]]) -> List[Tuple[str, str, str]]:
-    rows: List[Tuple[str, str, str]] = []
+async def fetch_balances(client, pairs):
+    rows = []
     for label, addr in pairs:
         bal = await ask_bot_for_balance(client, BOT_USERNAME, addr)
         rows.append((label, addr, bal))
@@ -427,9 +380,9 @@ async def fetch_balances(client: TelegramClient, pairs: List[Tuple[str, str]]) -
 # ----------------- MAIN -----------------
 async def main():
     load_dotenv()
-    api_id = int(os.getenv("API_ID", "0"))
-    api_hash = os.getenv("API_HASH")
-    phone = os.getenv("PHONE")
+    api_id     = int(os.getenv("API_ID", "0"))
+    api_hash   = os.getenv("API_HASH")
+    phone      = os.getenv("PHONE")
     discord_url = os.getenv("DISCORD_WEBHOOK", "")
     session_name = os.getenv("SESSION_NAME", "quantus_balance_session")
 
@@ -439,36 +392,39 @@ async def main():
 
     groups = read_groups()
     if not groups:
-        console.print("[red]Brak plików nodes*.txt z adresami[/red]")
+        console.print("[red]Brak plików nodes*.txt[/red]")
         return
 
     client = TelegramClient(session_name, api_id, api_hash)
     await client.connect()
+
     if not await client.is_user_authorized():
         await client.send_code_request(phone)
-        code = input("Wpisz kod z Telegrama: ")
+        code = input("Kod z Telegrama: ")
         try:
             await client.sign_in(phone=phone, code=code)
         except SessionPasswordNeededError:
-            pw = input("Masz 2FA – wpisz hasło: ")
+            pw = input("Hasło 2FA: ")
             await client.sign_in(password=pw)
 
     try:
-        groups_with_rows: List[Tuple[str, List[Tuple[str, str, str]]]] = []
+        groups_with_rows = []
         for owner, pairs in groups:
             rows = await fetch_balances(client, pairs)
             groups_with_rows.append((owner, rows))
             print_table(rows, f"Nody: {owner}")
 
-        all_rows = [row for _owner, rows in groups_with_rows for row in rows]
-        now_vals = {label: parse_balance_float(bal) for label, _addr, bal in all_rows}
+        # mapowanie addr → balance
+        all_rows = [r for _owner, rows in groups_with_rows for r in rows]
+        now_vals = {addr: parse_balance_float(bal) for _label, addr, bal in all_rows}
 
         history = load_history()
         now_ts = datetime.now()
         deltas = compute_deltas(now_vals, history, now_ts)
 
-        content = make_discord_text(groups_with_rows, now_vals, deltas)
-        send_to_discord(discord_url, content)
+        messages = make_discord_messages(groups_with_rows, now_vals, deltas)
+        for msg in messages:
+            send_to_discord(discord_url, msg)
 
         append_current_to_history(now_vals)
 
