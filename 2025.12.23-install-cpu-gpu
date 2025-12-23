@@ -35,7 +35,7 @@ apt_install_deps() {
   sudo apt-get update -y
   sudo apt-get install -y \
     git curl ca-certificates build-essential pkg-config libssl-dev clang cmake \
-    jq tmux
+    jq tmux protobuf-compiler
 }
 
 install_rust() {
