@@ -1,270 +1,255 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-### ========= helpers =========
+# Quantus Dirac installer (CPU + optional GPU)
+# - asks for node name, rewards wallet
+# - asks CPU cores (default detected-1)
+# - if GPU detected -> asks whether to enable GPU build path (best-effort)
+# - installs deps incl. protobuf-compiler (protoc)
+# - clones/updates Quantus chain + quantus-miner
+# - builds & creates tmux starter
+#
+# Notes:
+# - quantus-miner CLI flags vary; we set RAYON_NUM_THREADS to control CPU usage safely.
+# - GPU support is best-effort: we attempt to detect a "gpu/cuda/opencl" feature; if not found we build CPU-only.
+
 SUDO=""
-if [[ "$(id -u)" -ne 0 ]]; then
-  SUDO="sudo"
-fi
+if [[ "$(id -u)" -ne 0 ]]; then SUDO="sudo"; fi
 
-log() { echo -e "\n[+] $*\n"; }
-warn() { echo -e "\n[!] $*\n" >&2; }
+log(){ echo -e "\n[+] $*\n"; }
+warn(){ echo -e "\n[!] $*\n" >&2; }
 
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || { warn "Brakuje komendy: $1"; exit 1; }
-}
+need(){ command -v "$1" >/dev/null 2>&1 || { warn "Brakuje: $1"; exit 1; }; }
 
-prompt() {
-  local var_name="$1"
-  local text="$2"
-  local def="${3:-}"
-  local val=""
-  if [[ -n "$def" ]]; then
-    read -r -p "$text [$def]: " val
-    val="${val:-$def}"
+prompt(){
+  local __var="$1"; shift
+  local __txt="$1"; shift
+  local __def="${1:-}"
+  local __val=""
+  if [[ -n "$__def" ]]; then
+    read -r -p "$__txt [$__def]: " __val
+    __val="${__val:-$__def}"
   else
-    read -r -p "$text: " val
+    read -r -p "$__txt: " __val
   fi
-  printf -v "$var_name" "%s" "$val"
+  printf -v "$__var" "%s" "$__val"
 }
 
-is_yes() {
-  local x="${1:-}"
-  [[ "$x" =~ ^[Yy]$|^[Yy][Ee][Ss]$|^1$ ]]
+is_yes(){ [[ "${1:-}" =~ ^([Yy]|[Yy][Ee][Ss]|1)$ ]]; }
+
+df_avail_gb(){
+  # integer GB available on mountpoint
+  df -BG --output=avail "$1" | tail -n1 | tr -dc '0-9' || echo "0"
 }
 
-df_avail_gb() {
-  # prints integer GB available on mountpoint
-  local mp="$1"
-  df -BG --output=avail "$mp" 2>/dev/null | tail -n1 | tr -dc '0-9' || echo "0"
-}
-
-detect_gpu_summary() {
-  # prints a short summary if any GPU is present
-  if command -v lspci >/dev/null 2>&1; then
-    lspci | grep -Ei "VGA compatible controller|3D controller|Display controller" | sed 's/^/ - /' || true
-  else
-    echo ""
-  fi
-}
-
-github_latest_release() {
-  # args: owner repo
-  local owner="$1"
-  local repo="$2"
-  curl -fsSL "https://api.github.com/repos/${owner}/${repo}/releases/latest" | jq -r '.tag_name + " (" + .published_at + ")"' 2>/dev/null || true
-}
-
-git_update_or_clone() {
-  # args: url dir
+git_update_or_clone(){
   local url="$1"
   local dir="$2"
   if [[ -d "$dir/.git" ]]; then
-    log "Aktualizuję repo: $dir"
+    local before; before="$(git -C "$dir" rev-parse --short HEAD || true)"
     git -C "$dir" fetch --all -p
-    git -C "$dir" reset --hard origin/main || git -C "$dir" reset --hard origin/master
+    git -C "$dir" reset --hard origin/main 2>/dev/null || git -C "$dir" reset --hard origin/master
+    local after; after="$(git -C "$dir" rev-parse --short HEAD || true)"
+    if [[ -n "$before" && -n "$after" && "$before" != "$after" ]]; then
+      echo "Updated: $dir  $before -> $after"
+    else
+      echo "Up-to-date: $dir  ($after)"
+    fi
   else
-    log "Klonuję: $url -> $dir"
     git clone "$url" "$dir"
   fi
 }
 
-git_last_commit() {
-  local dir="$1"
-  git -C "$dir" log -1 --format='%h %ad %s' --date=short 2>/dev/null || true
+git_one_line(){
+  git -C "$1" log -1 --format='%h %ad %s' --date=short 2>/dev/null || true
 }
 
-### ========= preflight =========
-log "Pre-check systemu"
-
-if [[ -f /etc/os-release ]]; then
-  # shellcheck disable=SC1091
-  source /etc/os-release
-  echo "OS: ${PRETTY_NAME:-unknown}"
-else
-  warn "Nie wykryłem /etc/os-release (to nie wygląda na Ubuntu/Debian)."
-fi
-
-need_cmd bash
-
-ROOT_AVAIL_GB="$(df_avail_gb /)"
-if [[ "${ROOT_AVAIL_GB}" -lt 8 ]]; then
-  warn "Masz bardzo mało wolnego miejsca na / (ok. ${ROOT_AVAIL_GB} GB)."
-  warn "Najpierw zwolnij miejsce (np. usuń target/ i cache cargo), inaczej kompilacja nie ruszy."
-  warn "Szybki fix (jako root):"
-  echo "  rm -rf /root/quantus/chain/target /root/quantus/quantus-miner/target /root/.cargo/registry /root/.cargo/git && apt-get clean"
-  exit 1
-fi
-
-log "Instaluję zależności (w tym protobuf-compiler dla protoc)"
-
-$SUDO apt-get update -y
-$SUDO apt-get install -y \
-  git curl jq ca-certificates build-essential pkg-config clang cmake \
-  libssl-dev lz4 unzip \
-  protobuf-compiler
-
-# lspci is in pciutils (for GPU detection)
-$SUDO apt-get install -y pciutils || true
-
-### ========= inputs =========
-prompt NODE_NAME "Podaj nazwę noda (np. mitu-B650, quantus01)" "quantus-node"
-prompt REWARDS_ADDR "Podaj adres rewards (na który mają spływać nagrody)" ""
-
-CPU_TOTAL="$(nproc || echo 1)"
-CPU_DEF=$((CPU_TOTAL-1))
-if [[ "$CPU_DEF" -lt 1 ]]; then CPU_DEF=1; fi
-prompt CPU_WORKERS "Ile rdzeni CPU użyć do miningu? (Wykryto: ${CPU_TOTAL})" "$CPU_DEF"
-
-# GPU prompt (only if any GPU present)
-GPU_LINES="$(detect_gpu_summary)"
-USE_GPU="no"
-GPU_WORKERS="0"
-if [[ -n "${GPU_LINES// }" ]]; then
-  log "Wykryte GPU w systemie:\n${GPU_LINES}"
-  prompt USE_GPU "Czy włączyć mining na GPU? (wymaga build minera z GPU)" "no"
-  if is_yes "$USE_GPU"; then
-    prompt GPU_WORKERS "Ile workerów GPU? (zwykle 1)" "1"
+detect_gpu(){
+  if command -v lspci >/dev/null 2>&1; then
+    lspci | grep -Ei "VGA compatible controller|3D controller|Display controller" >/dev/null 2>&1
+  else
+    return 1
   fi
-else
-  log "Nie wykryłem GPU (albo brak pciutils). Lecę CPU-only."
-fi
+}
 
-# Node run mode (dev vs chain)
-prompt NODE_MODE "Tryb noda: wpisz 'dev' albo nazwę chain (np. local/dirac jeśli masz)" "dev"
+miner_detect_bin_package(){
+  # Prints the package name that owns the bin target called "quantus-miner" (best-effort).
+  # Requires jq.
+  local meta
+  meta="$(cargo metadata --no-deps --format-version=1 2>/dev/null || true)"
+  [[ -n "$meta" ]] || return 1
+  echo "$meta" | jq -r '
+    .packages[]
+    | select(any(.targets[]?; (any(.kind[]?; .=="bin") and .name=="quantus-miner")))
+    | .name
+  ' | head -n1
+}
 
-### ========= rust =========
-log "Rust toolchain (nightly) – wymagany przez Quantus node"
-if ! command -v rustup >/dev/null 2>&1; then
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-fi
+miner_feature_candidates(){
+  # Prints newline-separated feature keys for the miner package (best-effort).
+  local pkg="$1"
+  local meta
+  meta="$(cargo metadata --no-deps --format-version=1 2>/dev/null || true)"
+  [[ -n "$meta" ]] || return 1
+  echo "$meta" | jq -r --arg P "$pkg" '
+    .packages[] | select(.name==$P) | .features | keys[]?
+  ' 2>/dev/null | sort -u
+}
 
-# shellcheck disable=SC1091
-source "$HOME/.cargo/env"
+pick_gpu_feature(){
+  # Choose one of common feature names if present.
+  # Output: feature name (gpu/cuda/opencl/...), or empty if none.
+  local features="$1"
+  for f in gpu cuda opencl metal vulkan; do
+    if echo "$features" | grep -qx "$f"; then
+      echo "$f"; return 0
+    fi
+  done
+  echo ""
+}
 
-rustup toolchain install nightly -q
-rustup default nightly
+main(){
+  log "Preflight"
+  need git
+  need curl
 
-log "cargo version:"
-cargo --version || true
+  ROOT_AVAIL="$(df_avail_gb /)"
+  echo "Wolne miejsce na /: ~${ROOT_AVAIL} GB"
+  if [[ "$ROOT_AVAIL" -lt 10 ]]; then
+    warn "Masz mało miejsca na /. Build Rust potrafi zjeść dużo."
+    warn "Jeśli wyskoczy 'no space left', przenieś build na osobny dysk lub wyczyść target/ i ~/.cargo."
+  fi
 
-### ========= workspace (space-friendly) =========
-# Put build artifacts under a dedicated dir (helps keep things organized)
-BASE_DIR="${HOME}/quantus-${NODE_NAME}"
-log "Użyję katalogu roboczego: ${BASE_DIR}"
-mkdir -p "${BASE_DIR}/src" "${BASE_DIR}/logs" "${BASE_DIR}/state"
+  log "Deps"
+  $SUDO apt-get update -y
+  $SUDO apt-get install -y \
+    git curl jq ca-certificates \
+    build-essential pkg-config clang cmake \
+    libssl-dev lz4 unzip \
+    protobuf-compiler \
+    pciutils
 
-# IMPORTANT: build artifacts can be huge
-export CARGO_TARGET_DIR="${BASE_DIR}/cargo-target"
+  log "Inputs"
+  prompt NODE_NAME "Podaj nazwę noda (alias)" "quantus-node"
+  prompt REWARDS_ADDR "Podaj adres rewards (nagrody)" ""
 
-### ========= version checks =========
-log "Sprawdzam najnowsze wersje:"
-MINER_REL="$(github_latest_release "Quantus-Network" "quantus-miner")"
-if [[ -n "$MINER_REL" ]]; then
-  echo " - quantus-miner latest release: ${MINER_REL}"
-else
-  echo " - quantus-miner latest release: (nie udało się pobrać)"
-fi
-echo " - chain: brak gwarantowanych release — sprawdzę commit po aktualizacji"
+  CPU_TOTAL="$(nproc || echo 1)"
+  CPU_DEF=$((CPU_TOTAL-1)); [[ "$CPU_DEF" -lt 1 ]] && CPU_DEF=1
+  prompt CPU_WORKERS "Ile rdzeni CPU użyć? (Wykryto: ${CPU_TOTAL})" "$CPU_DEF"
 
-### ========= clone/update =========
-CHAIN_DIR="${BASE_DIR}/src/chain"
-MINER_DIR="${BASE_DIR}/src/quantus-miner"
+  USE_GPU="no"
+  if detect_gpu; then
+    echo "Wykryto GPU:"
+    lspci | grep -Ei "VGA compatible controller|3D controller|Display controller" | sed 's/^/ - /'
+    prompt USE_GPU "Czy chcesz dołączyć GPU (jeśli miner to wspiera)?" "no"
+  else
+    echo "GPU nie wykryte (albo brak lspci)."
+  fi
 
-git_update_or_clone "https://github.com/Quantus-Network/chain" "${CHAIN_DIR}"
-git_update_or_clone "https://github.com/Quantus-Network/quantus-miner" "${MINER_DIR}"
+  log "Rust (nightly)"
+  if ! command -v rustup >/dev/null 2>&1; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  fi
+  # shellcheck disable=SC1091
+  source "$HOME/.cargo/env"
+  rustup toolchain install nightly -q
+  rustup default nightly
 
-log "chain commit: $(git_last_commit "${CHAIN_DIR}")"
-log "miner commit: $(git_last_commit "${MINER_DIR}")"
+  BASE_DIR="$HOME/quantus-${NODE_NAME}"
+  mkdir -p "$BASE_DIR/src" "$BASE_DIR/logs" "$BASE_DIR/state"
+  echo "Katalog roboczy: $BASE_DIR"
 
-### ========= build chain =========
-log "Buduję quantus-node (release)"
-cd "${CHAIN_DIR}"
-cargo build --release -p quantus-node
+  CHAIN_DIR="$BASE_DIR/src/chain"
+  MINER_DIR="$BASE_DIR/src/quantus-miner"
 
-### ========= build miner =========
-log "Buduję quantus-miner (release)"
-cd "${MINER_DIR}"
-if is_yes "$USE_GPU"; then
-  # per repo README: build with GPU support uses --features gpu
-  cargo build -p miner-cli --features gpu --release
-else
-  cargo build -p miner-cli --release
-fi
+  log "Update/clone repos (sprawdzanie 'nowej wersji' = commit)"
+  git_update_or_clone "https://github.com/Quantus-Network/chain" "$CHAIN_DIR"
+  git_update_or_clone "https://github.com/Quantus-Network/quantus-miner" "$MINER_DIR"
 
-### ========= run scripts =========
-log "Tworzę skrypty startowe"
-START_NODE="${BASE_DIR}/start_node.sh"
-START_MINER="${BASE_DIR}/start_miner.sh"
-START_TMUX="${BASE_DIR}/start_tmux.sh"
+  echo "chain:  $(git_one_line "$CHAIN_DIR")"
+  echo "miner:  $(git_one_line "$MINER_DIR")"
 
-cat > "${START_MINER}" <<EOF
+  log "Build node (quantus-node)"
+  cd "$CHAIN_DIR"
+  cargo build --release -p quantus-node
+
+  log "Build external miner (quantus-miner)"
+  cd "$MINER_DIR"
+
+  MINER_PKG="$(miner_detect_bin_package || true)"
+  GPU_FEATURE=""
+  if [[ -n "$MINER_PKG" ]]; then
+    FEATS="$(miner_feature_candidates "$MINER_PKG" || true)"
+    GPU_FEATURE="$(pick_gpu_feature "$FEATS")"
+  fi
+
+  if is_yes "$USE_GPU"; then
+    if [[ -n "$MINER_PKG" && -n "$GPU_FEATURE" ]]; then
+      log "Miner: wykryłem feature '$GPU_FEATURE' w pakiecie '$MINER_PKG' -> buduję z GPU"
+      cargo build --release -p "$MINER_PKG" --features "$GPU_FEATURE"
+    else
+      warn "Nie wykryłem sensownego feature GPU w quantus-miner (albo nie umiem go rozpoznać). Buduję CPU-only."
+      cargo build --release
+    fi
+  else
+    cargo build --release
+  fi
+
+  log "Create start scripts"
+  START_MINER="$BASE_DIR/start_miner.sh"
+  START_NODE="$BASE_DIR/start_node.sh"
+  START_TMUX="$BASE_DIR/start_tmux.sh"
+
+  cat > "$START_MINER" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-cd "${MINER_DIR}"
+cd "$MINER_DIR"
 export RUST_LOG=info
-
-CPU_W="${CPU_WORKERS}"
-GPU_W="${GPU_WORKERS}"
-
-if [[ "\${GPU_W}" -gt 0 ]]; then
-  echo "[miner] start: CPU workers=\${CPU_W}, GPU workers=\${GPU_W}"
-  exec "${CARGO_TARGET_DIR}/release/quantus-miner" --cpu-workers "\${CPU_W}" --gpu-workers "\${GPU_W}" 2>&1 | tee -a "${BASE_DIR}/logs/miner.log"
-else
-  echo "[miner] start: CPU workers=\${CPU_W}"
-  exec "${CARGO_TARGET_DIR}/release/quantus-miner" --cpu-workers "\${CPU_W}" 2>&1 | tee -a "${BASE_DIR}/logs/miner.log"
-fi
+export RAYON_NUM_THREADS="$CPU_WORKERS"
+exec ./target/release/quantus-miner 2>&1 | tee -a "$BASE_DIR/logs/miner.log"
 EOF
 
-# NOTE: quantus-node binary is built in CHAIN_DIR target, not MINER target.
-# We built chain with CARGO_TARGET_DIR too, so it’s also in ${CARGO_TARGET_DIR}/release.
-cat > "${START_NODE}" <<EOF
+  cat > "$START_NODE" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-cd "${CHAIN_DIR}"
+cd "$CHAIN_DIR"
 export RUST_LOG=info,sc_consensus_pow=debug
-
-NODE_BIN="${CARGO_TARGET_DIR}/release/quantus-node"
-BASE_PATH="${BASE_DIR}/state"
-MINER_URL="http://127.0.0.1:9833"
-REWARDS="${REWARDS_ADDR}"
-
-if [[ "${NODE_MODE}" == "dev" ]]; then
-  echo "[node] start: --dev + external miner + rewards"
-  exec "\${NODE_BIN}" --dev --base-path "\${BASE_PATH}" --external-miner-url "\${MINER_URL}" --rewards-address "\${REWARDS}" 2>&1 | tee -a "${BASE_DIR}/logs/node.log"
-else
-  echo "[node] start: --chain ${NODE_MODE} --validator + external miner + rewards"
-  exec "\${NODE_BIN}" --chain "${NODE_MODE}" --validator --base-path "\${BASE_PATH}" --external-miner-url "\${MINER_URL}" --rewards-address "\${REWARDS}" 2>&1 | tee -a "${BASE_DIR}/logs/node.log"
-fi
+exec ./target/release/quantus-node \\
+  --dev \\
+  --base-path "$BASE_DIR/state" \\
+  --external-miner-url http://127.0.0.1:9833 \\
+  --rewards-address "$REWARDS_ADDR" 2>&1 | tee -a "$BASE_DIR/logs/node.log"
 EOF
 
-cat > "${START_TMUX}" <<EOF
+  cat > "$START_TMUX" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-SESSION="quantus-${NODE_NAME}"
-if ! command -v tmux >/dev/null 2>&1; then
-  ${SUDO} apt-get install -y tmux
-fi
+SESSION="quantus-$NODE_NAME"
+command -v tmux >/dev/null 2>&1 || ${SUDO} apt-get install -y tmux
 
-tmux has-session -t "\$SESSION" 2>/dev/null && { echo "Sesja \$SESSION już istnieje. Wejdź: tmux attach -t \$SESSION"; exit 0; }
+tmux has-session -t "\$SESSION" 2>/dev/null && {
+  echo "Sesja \$SESSION już istnieje. Wejdź: tmux attach -t \$SESSION"
+  exit 0
+}
 
-tmux new-session -d -s "\$SESSION" -n miner "bash '${START_MINER}'"
-tmux new-window -t "\$SESSION" -n node "bash '${START_NODE}'"
+tmux new-session -d -s "\$SESSION" -n miner "bash '$START_MINER'"
+tmux new-window -t "\$SESSION" -n node "bash '$START_NODE'"
 tmux select-window -t "\$SESSION:miner"
 
-echo "OK. Odpalone w tmux."
-echo "Wejdź: tmux attach -t \$SESSION"
+echo "OK. Wejdź: tmux attach -t \$SESSION"
 echo "Logi:"
-echo "  tail -f '${BASE_DIR}/logs/miner.log'"
-echo "  tail -f '${BASE_DIR}/logs/node.log'"
+echo "  tail -f '$BASE_DIR/logs/miner.log'"
+echo "  tail -f '$BASE_DIR/logs/node.log'"
 EOF
 
-chmod +x "${START_MINER}" "${START_NODE}" "${START_TMUX}"
+  chmod +x "$START_MINER" "$START_NODE" "$START_TMUX"
 
-log "GOTOWE ✅"
-echo "Start w tmux:"
-echo "  ${START_TMUX}"
-echo ""
-echo "Albo ręcznie w 2 terminalach:"
-echo "  bash ${START_MINER}"
-echo "  bash ${START_NODE}"
+  log "DONE ✅"
+  echo "Start w tmux:"
+  echo "  $START_TMUX"
+  echo ""
+  echo "Szybki status portu minera:"
+  echo "  ss -ltnp | grep 9833 || true"
+}
+
+main "$@"
