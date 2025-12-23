@@ -1,255 +1,368 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
-# Quantus Dirac installer (CPU + optional GPU)
-# - asks for node name, rewards wallet
-# - asks CPU cores (default detected-1)
-# - if GPU detected -> asks whether to enable GPU build path (best-effort)
-# - installs deps incl. protobuf-compiler (protoc)
-# - clones/updates Quantus chain + quantus-miner
-# - builds & creates tmux starter
-#
-# Notes:
-# - quantus-miner CLI flags vary; we set RAYON_NUM_THREADS to control CPU usage safely.
-# - GPU support is best-effort: we attempt to detect a "gpu/cuda/opencl" feature; if not found we build CPU-only.
+SCRIPT_VERSION="2025.12.23-docker-v1.0"
 
-SUDO=""
-if [[ "$(id -u)" -ne 0 ]]; then SUDO="sudo"; fi
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$BASE_DIR"
 
-log(){ echo -e "\n[+] $*\n"; }
-warn(){ echo -e "\n[!] $*\n" >&2; }
+CONFIG_DIR="$BASE_DIR/.quantus"
+CONFIG_FILE="$CONFIG_DIR/config.env"
+DATA_DIR="$BASE_DIR/data"
+UPSTREAM_DIR="$BASE_DIR/upstream"
 
-need(){ command -v "$1" >/dev/null 2>&1 || { warn "Brakuje: $1"; exit 1; }; }
+CHAIN_DIR="$UPSTREAM_DIR/chain"
+MINER_DIR="$UPSTREAM_DIR/quantus-miner"
 
-prompt(){
-  local __var="$1"; shift
-  local __txt="$1"; shift
-  local __def="${1:-}"
-  local __val=""
-  if [[ -n "$__def" ]]; then
-    read -r -p "$__txt [$__def]: " __val
-    __val="${__val:-$__def}"
+COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+
+NODE_IMAGE="quantus-node:local"
+MINER_IMAGE="quantus-miner:local"
+
+mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$UPSTREAM_DIR"
+
+say() { echo -e "\n==> $*\n"; }
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+as_root_prefix() {
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    echo ""
   else
-    read -r -p "$__txt: " __val
+    echo "sudo"
   fi
-  printf -v "$__var" "%s" "$__val"
 }
 
-is_yes(){ [[ "${1:-}" =~ ^([Yy]|[Yy][Ee][Ss]|1)$ ]]; }
+SUDO="$(as_root_prefix)"
 
-df_avail_gb(){
-  # integer GB available on mountpoint
-  df -BG --output=avail "$1" | tail -n1 | tr -dc '0-9' || echo "0"
+ask_yes_no() {
+  local prompt="$1"
+  local default="$2" # "tak" albo "nie"
+  local ans
+  while true; do
+    read -r -p "$prompt" ans || true
+    ans="$(echo "${ans:-}" | tr '[:upper:]' '[:lower:]')"
+    [[ -z "$ans" ]] && ans="$default"
+    case "$ans" in
+      tak|t|yes|y) echo "tak"; return 0 ;;
+      nie|n|no)    echo "nie"; return 0 ;;
+      *) echo "Wpisz: tak lub nie." ;;
+    esac
+  done
 }
 
-git_update_or_clone(){
+ensure_apt_pkgs() {
+  [[ -f /etc/debian_version ]] || return 0
+  $SUDO apt-get update -y
+  $SUDO apt-get install -y --no-install-recommends "$@"
+}
+
+ensure_git() {
+  if ! have git; then
+    say "Brak git — instaluję."
+    ensure_apt_pkgs git
+  fi
+}
+
+ensure_docker() {
+  if ! have docker; then
+    say "Brak Docker — instaluję (pakiety Ubuntu/Debian)."
+    ensure_apt_pkgs docker.io docker-compose-plugin
+  fi
+
+  # start docker jeśli jest systemd
+  if have systemctl; then
+    $SUDO systemctl enable --now docker || true
+  fi
+
+  if ! docker info >/dev/null 2>&1; then
+    die "Docker nie działa. Sprawdź: sudo systemctl status docker"
+  fi
+
+  if ! docker compose version >/dev/null 2>&1; then
+    say "Brak docker compose plugin — instaluję."
+    ensure_apt_pkgs docker-compose-plugin
+  fi
+}
+
+git_clone_or_pull() {
   local url="$1"
   local dir="$2"
+  local name="$3"
+
   if [[ -d "$dir/.git" ]]; then
-    local before; before="$(git -C "$dir" rev-parse --short HEAD || true)"
-    git -C "$dir" fetch --all -p
-    git -C "$dir" reset --hard origin/main 2>/dev/null || git -C "$dir" reset --hard origin/master
-    local after; after="$(git -C "$dir" rev-parse --short HEAD || true)"
-    if [[ -n "$before" && -n "$after" && "$before" != "$after" ]]; then
-      echo "Updated: $dir  $before -> $after"
-    else
-      echo "Up-to-date: $dir  ($after)"
+    local old
+    old="$(git -C "$dir" rev-parse --short HEAD || echo "unknown")"
+    say "Aktualizuję $name ($dir) — było: $old"
+    git -C "$dir" fetch --all --tags
+    git -C "$dir" pull --ff-only || true
+    local new
+    new="$(git -C "$dir" rev-parse --short HEAD || echo "unknown")"
+    echo "  -> jest: $new"
+    if [[ "$old" != "$new" ]]; then
+      echo "  -> NOWA WERSJA (zmiana commita)"
     fi
   else
+    say "Klonuję $name do: $dir"
     git clone "$url" "$dir"
+    local new
+    new="$(git -C "$dir" rev-parse --short HEAD || echo "unknown")"
+    echo "  -> commit: $new"
   fi
 }
 
-git_one_line(){
-  git -C "$1" log -1 --format='%h %ad %s' --date=short 2>/dev/null || true
+detect_cpu_default_workers() {
+  local cores
+  cores="$(nproc 2>/dev/null || echo 1)"
+  local def=$((cores - 2))
+  (( def < 1 )) && def=1
+  echo "$cores:$def"
 }
 
-detect_gpu(){
-  if command -v lspci >/dev/null 2>&1; then
-    lspci | grep -Ei "VGA compatible controller|3D controller|Display controller" >/dev/null 2>&1
-  else
-    return 1
+detect_gpu() {
+  # zwraca: "none" | "nvidia" | "dri"
+  local has_gpu="none"
+
+  if have nvidia-smi; then
+    has_gpu="nvidia"
   fi
-}
 
-miner_detect_bin_package(){
-  # Prints the package name that owns the bin target called "quantus-miner" (best-effort).
-  # Requires jq.
-  local meta
-  meta="$(cargo metadata --no-deps --format-version=1 2>/dev/null || true)"
-  [[ -n "$meta" ]] || return 1
-  echo "$meta" | jq -r '
-    .packages[]
-    | select(any(.targets[]?; (any(.kind[]?; .=="bin") and .name=="quantus-miner")))
-    | .name
-  ' | head -n1
-}
+  if [[ -e /dev/dri/card0 || -e /dev/dri/renderD128 ]]; then
+    # AMD/Intel (Vulkan/DRI)
+    [[ "$has_gpu" == "none" ]] && has_gpu="dri"
+  fi
 
-miner_feature_candidates(){
-  # Prints newline-separated feature keys for the miner package (best-effort).
-  local pkg="$1"
-  local meta
-  meta="$(cargo metadata --no-deps --format-version=1 2>/dev/null || true)"
-  [[ -n "$meta" ]] || return 1
-  echo "$meta" | jq -r --arg P "$pkg" '
-    .packages[] | select(.name==$P) | .features | keys[]?
-  ' 2>/dev/null | sort -u
-}
-
-pick_gpu_feature(){
-  # Choose one of common feature names if present.
-  # Output: feature name (gpu/cuda/opencl/...), or empty if none.
-  local features="$1"
-  for f in gpu cuda opencl metal vulkan; do
-    if echo "$features" | grep -qx "$f"; then
-      echo "$f"; return 0
+  # fallback: lspci
+  if [[ "$has_gpu" == "none" ]] && have lspci; then
+    if lspci | grep -qiE 'VGA|3D|Display'; then
+      has_gpu="dri"
     fi
+  fi
+
+  echo "$has_gpu"
+}
+
+load_existing_config() {
+  # shellcheck disable=SC1090
+  if [[ -f "$CONFIG_FILE" ]]; then
+    set -a
+    source "$CONFIG_FILE"
+    set +a
+  fi
+}
+
+save_config() {
+  mkdir -p "$CONFIG_DIR"
+  cat > "$CONFIG_FILE" <<EOF
+# Generated by quantus-dirac installer
+SCRIPT_VERSION=$SCRIPT_VERSION
+NODE_NAME=${NODE_NAME}
+REWARDS_ADDRESS=${REWARDS_ADDRESS}
+MINER_CPU_WORKERS=${MINER_CPU_WORKERS}
+MINER_GPU_WORKERS=${MINER_GPU_WORKERS}
+GPU_MODE=${GPU_MODE}
+EOF
+}
+
+write_compose() {
+  local gpu_block=""
+  if [[ "${GPU_MODE}" == "nvidia" ]] && [[ "${MINER_GPU_WORKERS}" != "0" ]]; then
+    gpu_block=$'    gpus: all\n'
+  elif [[ "${GPU_MODE}" == "dri" ]] && [[ "${MINER_GPU_WORKERS}" != "0" ]]; then
+    # mapuj /dev/dri tylko jeśli istnieje
+    if [[ -d /dev/dri ]]; then
+      gpu_block=$'    devices:\n      - /dev/dri:/dev/dri\n'
+      # często potrzebne prawa do renderowania
+      gpu_block+=$'    group_add:\n      - video\n'
+    fi
+  fi
+
+  # Compose korzysta z wartości podstawianych z --env-file
+  cat > "$COMPOSE_FILE" <<EOF
+services:
+  miner:
+    image: ${MINER_IMAGE}
+    container_name: quantus-miner
+    restart: unless-stopped
+    environment:
+      - RUST_LOG=info
+    command: ["--cpu-workers","\${MINER_CPU_WORKERS}","--gpu-workers","\${MINER_GPU_WORKERS}","--port","9833"]
+    ports:
+      - "127.0.0.1:9833:9833"
+${gpu_block}  node:
+    image: ${NODE_IMAGE}
+    container_name: quantus-node
+    restart: unless-stopped
+    depends_on:
+      - miner
+    environment:
+      - RUST_LOG=info,sc_consensus_pow=debug
+    volumes:
+      - "./data/node:/data"
+    ports:
+      - "30333:30333"
+      - "9944:9944"
+      - "9933:9933"
+    command:
+      [
+        "--dev",
+        "--name","\${NODE_NAME}",
+        "--base-path","/data",
+        "--external-miner-url","http://miner:9833",
+        "--rewards-address","\${REWARDS_ADDRESS}"
+      ]
+EOF
+}
+
+build_images() {
+  say "Buduję obrazy Docker (to może chwilę potrwać przy pierwszym razie)…"
+  $SUDO docker build -t "$NODE_IMAGE" -f "$BASE_DIR/docker/node.Dockerfile" "$CHAIN_DIR"
+  $SUDO docker build -t "$MINER_IMAGE" -f "$BASE_DIR/docker/miner.Dockerfile" "$MINER_DIR"
+}
+
+generate_rewards_address_if_needed() {
+  # build node image musi być już gotowy
+  say "Generuję nowy adres nagród (quantus-node key quantus)…"
+  local tmp
+  tmp="$(mktemp)"
+
+  # pokaż output użytkownikowi + zapisz do pliku
+  set +e
+  $SUDO docker run --rm "$NODE_IMAGE" key quantus 2>&1 | tee "$tmp"
+  local rc=${PIPESTATUS[0]}
+  set -e
+  [[ $rc -eq 0 ]] || die "Nie udało się wygenerować klucza (exit=$rc)."
+
+  # próba parsowania adresu (substrate ss58 często zaczyna się od '5')
+  local parsed=""
+  parsed="$(grep -Eo '\b5[1-9A-HJ-NP-Za-km-z]{40,70}\b' "$tmp" | head -n1 || true)"
+
+  if [[ -z "$parsed" ]]; then
+    echo ""
+    echo "Nie udało się automatycznie wykryć adresu z outputu."
+    read -r -p "Wklej adres nagród (REWARDS_ADDRESS): " parsed
+    parsed="$(echo "${parsed:-}" | tr -d '[:space:]')"
+  fi
+
+  [[ -n "$parsed" ]] || die "Brak adresu nagród."
+
+  REWARDS_ADDRESS="$parsed"
+  rm -f "$tmp"
+
+  # twarde czekanie na potwierdzenie
+  while true; do
+    local ok
+    ok="$(ask_yes_no "Czy zapisałeś adres i seedy? (tak/nie) [nie]: " "nie")"
+    [[ "$ok" == "tak" ]] && break
+    echo "OK — zapisz teraz i potwierdź 'tak', wtedy pójdziemy dalej."
   done
-  echo ""
 }
 
-main(){
-  log "Preflight"
-  need git
-  need curl
+main() {
+  say "Quantus Dirac installer ($SCRIPT_VERSION) — Docker (node + external miner)"
 
-  ROOT_AVAIL="$(df_avail_gb /)"
-  echo "Wolne miejsce na /: ~${ROOT_AVAIL} GB"
-  if [[ "$ROOT_AVAIL" -lt 10 ]]; then
-    warn "Masz mało miejsca na /. Build Rust potrafi zjeść dużo."
-    warn "Jeśli wyskoczy 'no space left', przenieś build na osobny dysk lub wyczyść target/ i ~/.cargo."
+  ensure_git
+  ensure_docker
+  ensure_apt_pkgs curl jq ca-certificates pciutils || true
+
+  # Upstream update
+  git_clone_or_pull "https://github.com/Quantus-Network/chain" "$CHAIN_DIR" "Quantus chain"
+  git_clone_or_pull "https://github.com/Quantus-Network/quantus-miner" "$MINER_DIR" "Quantus miner"
+
+  # config
+  load_existing_config
+
+  local have_saved="no"
+  if [[ -n "${NODE_NAME:-}" && -n "${REWARDS_ADDRESS:-}" ]]; then
+    have_saved="yes"
+    echo "Znaleziono zapisane dane:"
+    echo "  NODE_NAME       = ${NODE_NAME}"
+    echo "  REWARDS_ADDRESS = ${REWARDS_ADDRESS}"
+    echo ""
+    local use_saved
+    use_saved="$(ask_yes_no "Użyć zapisanych danych? (tak/nie) [tak]: " "tak")"
+    if [[ "$use_saved" != "tak" ]]; then
+      NODE_NAME=""
+      REWARDS_ADDRESS=""
+    fi
   fi
 
-  log "Deps"
-  $SUDO apt-get update -y
-  $SUDO apt-get install -y \
-    git curl jq ca-certificates \
-    build-essential pkg-config clang cmake \
-    libssl-dev lz4 unzip \
-    protobuf-compiler \
-    pciutils
+  if [[ -z "${NODE_NAME:-}" || -z "${REWARDS_ADDRESS:-}" ]]; then
+    local want_manual
+    want_manual="$(ask_yes_no "Czy chcesz podać nazwę noda i adres nagród? (tak/nie) [tak]: " "tak")"
 
-  log "Inputs"
-  prompt NODE_NAME "Podaj nazwę noda (alias)" "quantus-node"
-  prompt REWARDS_ADDR "Podaj adres rewards (nagrody)" ""
+    if [[ "$want_manual" == "tak" ]]; then
+      local def_name
+      def_name="$(hostname | tr -d '[:space:]')"
+      read -r -p "Podaj nazwę Noda [${def_name}]: " NODE_NAME
+      NODE_NAME="${NODE_NAME:-$def_name}"
 
-  CPU_TOTAL="$(nproc || echo 1)"
-  CPU_DEF=$((CPU_TOTAL-1)); [[ "$CPU_DEF" -lt 1 ]] && CPU_DEF=1
-  prompt CPU_WORKERS "Ile rdzeni CPU użyć? (Wykryto: ${CPU_TOTAL})" "$CPU_DEF"
-
-  USE_GPU="no"
-  if detect_gpu; then
-    echo "Wykryto GPU:"
-    lspci | grep -Ei "VGA compatible controller|3D controller|Display controller" | sed 's/^/ - /'
-    prompt USE_GPU "Czy chcesz dołączyć GPU (jeśli miner to wspiera)?" "no"
-  else
-    echo "GPU nie wykryte (albo brak lspci)."
-  fi
-
-  log "Rust (nightly)"
-  if ! command -v rustup >/dev/null 2>&1; then
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-  fi
-  # shellcheck disable=SC1091
-  source "$HOME/.cargo/env"
-  rustup toolchain install nightly -q
-  rustup default nightly
-
-  BASE_DIR="$HOME/quantus-${NODE_NAME}"
-  mkdir -p "$BASE_DIR/src" "$BASE_DIR/logs" "$BASE_DIR/state"
-  echo "Katalog roboczy: $BASE_DIR"
-
-  CHAIN_DIR="$BASE_DIR/src/chain"
-  MINER_DIR="$BASE_DIR/src/quantus-miner"
-
-  log "Update/clone repos (sprawdzanie 'nowej wersji' = commit)"
-  git_update_or_clone "https://github.com/Quantus-Network/chain" "$CHAIN_DIR"
-  git_update_or_clone "https://github.com/Quantus-Network/quantus-miner" "$MINER_DIR"
-
-  echo "chain:  $(git_one_line "$CHAIN_DIR")"
-  echo "miner:  $(git_one_line "$MINER_DIR")"
-
-  log "Build node (quantus-node)"
-  cd "$CHAIN_DIR"
-  cargo build --release -p quantus-node
-
-  log "Build external miner (quantus-miner)"
-  cd "$MINER_DIR"
-
-  MINER_PKG="$(miner_detect_bin_package || true)"
-  GPU_FEATURE=""
-  if [[ -n "$MINER_PKG" ]]; then
-    FEATS="$(miner_feature_candidates "$MINER_PKG" || true)"
-    GPU_FEATURE="$(pick_gpu_feature "$FEATS")"
-  fi
-
-  if is_yes "$USE_GPU"; then
-    if [[ -n "$MINER_PKG" && -n "$GPU_FEATURE" ]]; then
-      log "Miner: wykryłem feature '$GPU_FEATURE' w pakiecie '$MINER_PKG' -> buduję z GPU"
-      cargo build --release -p "$MINER_PKG" --features "$GPU_FEATURE"
+      read -r -p "Podaj adres do nagród (REWARDS_ADDRESS): " REWARDS_ADDRESS
+      REWARDS_ADDRESS="$(echo "${REWARDS_ADDRESS:-}" | tr -d '[:space:]')"
+      [[ -n "$REWARDS_ADDRESS" ]] || die "Adres nagród nie może być pusty."
     else
-      warn "Nie wykryłem sensownego feature GPU w quantus-miner (albo nie umiem go rozpoznać). Buduję CPU-only."
-      cargo build --release
+      # auto: nazwa z hosta, adres generowany
+      NODE_NAME="$(hostname | tr -d '[:space:]')"
+      build_images
+      generate_rewards_address_if_needed
+    fi
+  fi
+
+  # CPU workers
+  local cores def_workers chosen
+  IFS=":" read -r cores def_workers <<<"$(detect_cpu_default_workers)"
+  echo "Wykryto rdzenie (logiczne): $cores"
+  while true; do
+    read -r -p "Ile rdzeni użyć dla minera? [${def_workers}]: " chosen
+    chosen="${chosen:-$def_workers}"
+    if [[ "$chosen" =~ ^[0-9]+$ ]] && (( chosen >= 1 && chosen <= cores )); then
+      MINER_CPU_WORKERS="$chosen"
+      break
+    fi
+    echo "Podaj liczbę 1..$cores"
+  done
+
+  # GPU
+  GPU_MODE="$(detect_gpu)"
+  MINER_GPU_WORKERS="0"
+
+  if [[ "$GPU_MODE" != "none" ]]; then
+    echo "Wykryto GPU: $GPU_MODE"
+    local use_gpu
+    use_gpu="$(ask_yes_no "Czy użyć GPU w minerze? (tak/nie) [nie]: " "nie")"
+    if [[ "$use_gpu" == "tak" ]]; then
+      MINER_GPU_WORKERS="1"
     fi
   else
-    cargo build --release
+    echo "Nie wykryto GPU."
   fi
 
-  log "Create start scripts"
-  START_MINER="$BASE_DIR/start_miner.sh"
-  START_NODE="$BASE_DIR/start_node.sh"
-  START_TMUX="$BASE_DIR/start_tmux.sh"
+  save_config
 
-  cat > "$START_MINER" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-cd "$MINER_DIR"
-export RUST_LOG=info
-export RAYON_NUM_THREADS="$CPU_WORKERS"
-exec ./target/release/quantus-miner 2>&1 | tee -a "$BASE_DIR/logs/miner.log"
-EOF
+  # build if not already (manual path)
+  if ! $SUDO docker image inspect "$NODE_IMAGE" >/dev/null 2>&1 || ! $SUDO docker image inspect "$MINER_IMAGE" >/dev/null 2>&1; then
+    build_images
+  fi
 
-  cat > "$START_NODE" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-cd "$CHAIN_DIR"
-export RUST_LOG=info,sc_consensus_pow=debug
-exec ./target/release/quantus-node \\
-  --dev \\
-  --base-path "$BASE_DIR/state" \\
-  --external-miner-url http://127.0.0.1:9833 \\
-  --rewards-address "$REWARDS_ADDR" 2>&1 | tee -a "$BASE_DIR/logs/node.log"
-EOF
+  write_compose
 
-  cat > "$START_TMUX" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-SESSION="quantus-$NODE_NAME"
-command -v tmux >/dev/null 2>&1 || ${SUDO} apt-get install -y tmux
+  say "Startuję stack (docker compose up -d)…"
+  $SUDO docker compose --env-file "$CONFIG_FILE" -f "$COMPOSE_FILE" up -d --remove-orphans
 
-tmux has-session -t "\$SESSION" 2>/dev/null && {
-  echo "Sesja \$SESSION już istnieje. Wejdź: tmux attach -t \$SESSION"
-  exit 0
-}
+  $SUDO docker compose --env-file "$CONFIG_FILE" -f "$COMPOSE_FILE" ps
 
-tmux new-session -d -s "\$SESSION" -n miner "bash '$START_MINER'"
-tmux new-window -t "\$SESSION" -n node "bash '$START_NODE'"
-tmux select-window -t "\$SESSION:miner"
-
-echo "OK. Wejdź: tmux attach -t \$SESSION"
-echo "Logi:"
-echo "  tail -f '$BASE_DIR/logs/miner.log'"
-echo "  tail -f '$BASE_DIR/logs/node.log'"
-EOF
-
-  chmod +x "$START_MINER" "$START_NODE" "$START_TMUX"
-
-  log "DONE ✅"
-  echo "Start w tmux:"
-  echo "  $START_TMUX"
   echo ""
-  echo "Szybki status portu minera:"
-  echo "  ss -ltnp | grep 9833 || true"
+  echo "Gotowe."
+  echo "Logi:"
+  echo "  docker logs -f quantus-node"
+  echo "  docker logs -f quantus-miner"
+  echo ""
+  echo "Benchmark minera (wrapper):"
+  echo "  ./quantus-miner benchmark --engine gpu --duration 30"
+  echo "  ./quantus-miner benchmark --engine cpu --cpu-workers ${MINER_CPU_WORKERS} --duration 30"
+  echo ""
+  echo "Uwaga: upstream miner używa składni benchmark --gpu-workers/--cpu-workers (bez --engine). "
 }
 
 main "$@"
